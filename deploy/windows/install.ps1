@@ -70,7 +70,9 @@ function Restrict-ToCurrentUser([string]$Path) {
     # Local "Continue": with "Stop", Windows PowerShell 5.1 turns a native command's stderr
     # into a terminating error.
     $ErrorActionPreference = "Continue"
-    $out = & icacls.exe $Path /inheritance:r /grant:r "${Account}:F" 2>&1
+    # /reset first: entries left explicit by an earlier run would otherwise survive.
+    $out = & icacls.exe $Path /reset 2>&1
+    if ($LASTEXITCODE -eq 0) { $out = & icacls.exe $Path /inheritance:r /grant:r "${Account}:F" 2>&1 }
     if ($LASTEXITCODE -ne 0) {
         Write-Host "WARNING: could not restrict permissions on $Path ($out)" -ForegroundColor Yellow
     }
