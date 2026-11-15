@@ -8,3 +8,12 @@ __pycache__/
 *.pyc
 .pytest_cache/
 dist/
+
+# Secrets / local state in the repository root. Root-anchored (leading "/") so that
+# source and tests such as achichi_notifier/cookies.py or tests/test_cookies.py stay tracked.
+/*cookies*.txt
+/*cookies*.json
+/*.b64
+/*state*.json
+.env.*
+!.env.example

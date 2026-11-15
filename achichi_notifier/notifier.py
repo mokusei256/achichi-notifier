@@ -5,22 +5,24 @@ from __future__ import annotations
 import json
 import logging
 import os
-import platform
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 
 from . import render
 from .config import Config, ConfigError
 from .discord_api import DiscordClient, DiscordError
-from .state import DiscordStateStore, FileStateStore, State, now_iso, parse_time
+from .state import BACKLOG_PREFIX, DiscordStateStore, FileStateStore, State, now_iso, parse_time
 from .youtube import (
-    VIDEO_TABS, ChannelMeta, Post, VideoRef, YouTubeClient, YouTubeError, approx_age_hours,
+    VIDEO_TABS, ChannelMeta, Post, PostsPage, VideoRef, YouTubeClient, YouTubeError,
+    approx_age_hours,
 )
 
 log = logging.getLogger(__name__)
 
 ROLES = ("primary", "fallback")
 COOKIE_ALERT_INTERVAL = timedelta(hours=24)
+# Consecutive failed members-only checks before the state channel is told (~1h on the Mac).
+FETCH_FAIL_ALERT_STREAK = 6
 
 
 @dataclass
@@ -35,13 +37,28 @@ class Notification:
     def group(self) -> str:
         return render.GROUPS[self.kind]
 
+    @property
+    def url(self) -> str | None:
+        embeds = self.payload.get("embeds") or [{}]
+        return embeds[0].get("url")
+
 
 @dataclass
 class CollectResult:
     notifications: list[Notification] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
     meta: ChannelMeta | None = None
-    posts_logged_in: bool | None = None
+    # Members-only check outcome. Cookie problems never count as errors: they must not
+    # stop video/public-post notifications or make the fallback take over everything.
+    member_status: str | None = None  # None | ok | unreadable | logged_out | not_member | fetch_failed
+    member_detail: str | None = None
+    queued: set = field(default_factory=set)
+
+    def queue(self, note: Notification) -> None:
+        key = (note.item_type, note.item_id)
+        if key not in self.queued:  # one notification per item per run
+            self.queued.add(key)
+            self.notifications.append(note)
 
 
 def make_store(cfg: Config, discord: DiscordClient | None):
@@ -56,6 +73,55 @@ def _mention(cfg: Config, kind: str) -> str | None:
     if kind == "member_post":
         return cfg.mentions.get("member_post") or cfg.mentions.get("post")
     return cfg.mentions.get(render.GROUPS[kind])
+
+
+def comparable_public_page(public_page: PostsPage | None,
+                           member_page: PostsPage | None) -> PostsPage | None:
+    """The logged-out page can tell members-only posts apart only if it is a real logged-out
+    post list. An empty list proves nothing while the member sees unbadged posts."""
+    if public_page is None or not public_page.valid or public_page.logged_in:
+        return None
+    if (not public_page.posts and member_page is not None
+            and any(not p.members_only for p in member_page.posts)):
+        return None
+    return public_page
+
+
+def member_page_problem(member_page: PostsPage, public_page: PostsPage | None) -> str | None:
+    """Reasons not to trust the member's view this run (checked on real pages: every post a
+    logged-out viewer sees also appears in the member's view)."""
+    if not member_page.valid or (not member_page.posts and not member_page.locked_without_id):
+        return "member view had no post list"
+    if public_page is not None:
+        member_ids = {p.post_id for p in member_page.posts}
+        if any(p.post_id not in member_ids for p in public_page.posts):
+            return "member view is missing posts that logged-out viewers see"
+    return None
+
+
+def classify_member_posts(member_page: PostsPage,
+                          public_page: PostsPage | None) -> tuple[list[Post], list[Post]]:
+    """Split the member's view into (badge-marked members-only posts, posts that are
+    members-only only by comparison with the logged-out page).
+
+    public_page must come from comparable_public_page(); without it only badge-marked posts
+    are reported. Badge-marked posts win even if logged-out viewers see them (fail-closed).
+    Every returned post has members_only=True so its content is never rendered.
+    """
+    public_ids = {p.post_id for p in public_page.posts} if public_page is not None else None
+    badge: list[Post] = []
+    by_comparison: list[Post] = []
+    for post in member_page.posts:
+        if post.members_only:
+            badge.append(post)
+        elif public_ids is not None and post.post_id not in public_ids:
+            by_comparison.append(replace(post, members_only=True))
+    if public_ids is not None and any(p.post_id in public_ids for p in badge):
+        log.warning("a badge-marked members-only post is also visible logged out; announcing it link-only")
+    if by_comparison:
+        log.warning("%d post(s) hidden from logged-out viewers carry no members-only badge; "
+                    "they are announced after a second confirming check", len(by_comparison))
+    return badge, by_comparison
 
 
 def _merge_refs(groups: list[list[VideoRef]]) -> list[VideoRef]:
@@ -116,7 +182,7 @@ class Notifier:
                 state.videos[ref.video_id] = now_iso()
                 continue
             log.info("new video %s kind=%s members_only=%s", ref.video_id, info.kind, info.members_only)
-            result.notifications.append(Notification(
+            result.queue(Notification(
                 kind=info.kind,
                 item_type="video",
                 item_id=ref.video_id,
@@ -126,44 +192,154 @@ class Notifier:
 
     # ------------------------------------------------------------------ posts
 
-    def check_posts(self, state: State, result: CollectResult) -> None:
-        try:
-            page = self.yt.fetch_posts()
-        except YouTubeError as exc:
-            result.errors.append(f"posts: {exc}")
-            return
-        result.posts_logged_in = page.logged_in
-        result.meta = result.meta or page.meta
-        scope = "posts_member" if page.logged_in else "posts"
-        if scope not in state.seeded:
+    def _post_age_ok(self, post: Post) -> bool:
+        age = approx_age_hours(post.published_text)
+        return age is None or age <= self.max_age.total_seconds() / 3600
+
+    def _post_sort_key(self, post: Post, index: int) -> datetime:
+        age = approx_age_hours(post.published_text) or 0
+        return self.now - timedelta(hours=age) + timedelta(microseconds=index)
+
+    def _queue_post(self, result: CollectResult, post: Post, kind: str, index: int) -> None:
+        result.queue(Notification(
+            kind=kind, item_type="post", item_id=post.post_id,
+            sort_key=self._post_sort_key(post, index),
+            payload=render.post_payload(post, result.meta, _mention(self.cfg, kind)),
+        ))
+
+    def _process_public(self, state: State, result: CollectResult, page: PostsPage,
+                        exclude: set[str]) -> None:
+        if "posts" not in state.seeded:
+            if not page.valid and not page.posts:
+                log.warning("logged-out posts page had no post list; posts not seeded yet")
+                return
             for post in page.posts:
                 state.posts.setdefault(post.post_id, now_iso())
-            state.seeded[scope] = now_iso()
-            log.info("initial %s run: marked %d existing posts as seen", scope, len(page.posts))
+            state.seeded["posts"] = now_iso()
+            log.info("initial posts run: marked %d existing posts as seen", len(page.posts))
             return
-        new = [p for p in page.posts if p.post_id not in state.posts]
-        # Posts are listed newest first; announce oldest first.
-        for index, post in enumerate(reversed(new)):
-            age = approx_age_hours(post.published_text)
-            if age is not None and age > self.max_age.total_seconds() / 3600:
-                log.info("post %s is old; marking seen without notifying", post.post_id)
+        new = [p for p in page.posts if p.post_id not in state.posts and p.post_id not in exclude]
+        for index, post in enumerate(reversed(new)):  # listed newest first; announce oldest first
+            if not self._post_age_ok(post):
+                log.debug("post %s is old; marking seen without notifying", post.post_id)
                 state.posts[post.post_id] = now_iso()
                 continue
+            # A post the logged-out page itself flags as members-only (e.g. a future locked
+            # teaser) is still announced link-only.
             kind = "member_post" if post.members_only else "post"
-            # Never log post text: Actions logs of a public repo are public.
-            log.info("new post %s members_only=%s", post.post_id, post.members_only)
-            result.notifications.append(Notification(
-                kind=kind,
-                item_type="post",
-                item_id=post.post_id,
-                sort_key=self.now - timedelta(hours=age or 0) + timedelta(microseconds=index),
-                payload=render.post_payload(post, result.meta, _mention(self.cfg, kind)),
-            ))
+            if kind == "post":
+                log.info("new post %s", post.post_id)  # public post; never log any post text
+            self._queue_post(result, post, kind, index)
 
-    def collect(self, state: State) -> CollectResult:
+    def _process_members(self, state: State, result: CollectResult, member_page: PostsPage,
+                         public_page: PostsPage | None) -> None:
+        badge, by_comparison = classify_member_posts(member_page, public_page)
+        if member_page.locked_without_id:
+            log.warning("%d locked members-only post(s) had no recognizable id and were skipped",
+                        member_page.locked_without_id)
+        seeding = False
+        if "posts_member" not in state.seeded:
+            # Badge-marked posts need no comparison, so this baseline never waits for the
+            # logged-out page.
+            for post in badge:
+                state.posts.setdefault(post.post_id, now_iso())
+            state.seeded["posts_member"] = now_iso()
+            log.info("initial members-only check: existing members-only posts marked as seen")
+            seeding = True
+        if public_page is not None and "posts_member_diff" not in state.seeded:
+            # First usable comparison: posts hidden from logged-out viewers right now are an
+            # existing backlog. They go to pending and are settled silently once confirmed,
+            # because one of them could still be a public post that is not visible yet.
+            for post in by_comparison:
+                if post.post_id not in state.posts:
+                    state.pending[post.post_id] = BACKLOG_PREFIX + now_iso()
+            state.seeded["posts_member_diff"] = now_iso()
+            seeding = True
+        if seeding:
+            return
+        announce: list[Post] = [p for p in badge if p.post_id not in state.posts]
+        for post in by_comparison:
+            if post.post_id in state.posts:
+                continue
+            marker = state.pending.get(post.post_id)
+            if marker is None:
+                state.pending[post.post_id] = now_iso()
+            elif marker.startswith(BACKLOG_PREFIX):
+                state.posts[post.post_id] = now_iso()  # existed before the baseline: settle silently
+                del state.pending[post.post_id]
+            else:
+                announce.append(post)  # second observation: confirmed
+        announced = 0
+        for index, post in enumerate(reversed(announce)):
+            if not self._post_age_ok(post):
+                state.posts[post.post_id] = now_iso()
+                state.pending.pop(post.post_id, None)
+                continue
+            announced += 1
+            log.debug("new members-only post %s", post.post_id)
+            self._queue_post(result, replace(post, members_only=True), "member_post", index)
+        if announced:
+            log.info("%d new members-only post(s)", announced)  # no ids/text in public logs
+
+    def _fetch_member_page(self, result: CollectResult) -> PostsPage | None:
+        if not self.yt.cookies_configured:
+            return None
+        if self.yt.cookie_error or not self.yt.has_cookies:
+            result.member_status, result.member_detail = "unreadable", self.yt.cookie_error
+            return None
+        try:
+            page = self.yt.fetch_posts_page(member=True)
+        except YouTubeError as exc:
+            result.member_status, result.member_detail = "fetch_failed", str(exc)
+            return None
+        if not page.logged_in:
+            result.member_status = "logged_out"
+            return None
+        if page.membership == "not_member":
+            result.member_status = "not_member"  # a non-member sees no members-only posts
+            return None
+        result.member_status = "ok"
+        return page
+
+    def check_posts(self, state: State, result: CollectResult, include_public: bool = True) -> None:
+        # The member page is fetched first and the logged-out page second, so a public post
+        # published in between is never mistaken for a members-only one.
+        member_page = self._fetch_member_page(result)
+        public_page = None
+        if include_public or member_page is not None:
+            try:
+                public_page = self.yt.fetch_posts_page(member=False)
+            except YouTubeError as exc:
+                if include_public:
+                    result.errors.append(f"posts: {exc}")
+                else:
+                    log.warning("logged-out posts page unavailable: %s", exc)
+        if public_page is not None and public_page.logged_in:
+            # Must never happen (the logged-out session carries no account cookies).
+            result.errors.append("posts: logged-out page came back logged in")
+            public_page = None
+        for page in (public_page, member_page):
+            if page is not None:
+                result.meta = result.meta or page.meta
+        comparable = comparable_public_page(public_page, member_page)
+        if member_page is not None and (problem := member_page_problem(member_page, comparable)):
+            result.member_status, result.member_detail = "fetch_failed", problem
+            member_page = None
+        badge_ids = {p.post_id for p in member_page.posts if p.members_only} if member_page else set()
+        if include_public and public_page is not None:
+            self._process_public(state, result, public_page, exclude=badge_ids)
+        if member_page is not None:
+            self._process_members(state, result, member_page, comparable)
+
+    def collect(self, state: State, mode: str = "full") -> CollectResult:
         result = CollectResult()
-        self.check_videos(state, result)
-        self.check_posts(state, result)
+        if mode == "full":
+            self.check_videos(state, result)
+            self.check_posts(state, result, include_public=True)
+        elif mode == "members":
+            self.check_posts(state, result, include_public=False)
+        else:
+            raise ValueError(f"unknown mode {mode!r}")
         result.notifications.sort(key=lambda n: n.sort_key)
         return result
 
@@ -171,25 +347,100 @@ class Notifier:
 # ---------------------------------------------------------------------- entry points
 
 
+def _fresh(value: str | None, now: datetime, minutes: float) -> bool:
+    last = parse_time(value)
+    return bool(last and now - last < timedelta(minutes=minutes))
+
+
 def _primary_is_fresh(state: State, cfg: Config, now: datetime) -> bool:
-    last = parse_time(state.runners.get("primary", {}).get("last_success"))
-    return bool(last and now - last < timedelta(minutes=cfg.fallback_after_minutes))
+    return _fresh(state.runners.get("primary", {}).get("last_success"), now, cfg.fallback_after_minutes)
 
 
-def _cookie_alert(cfg: Config, discord: DiscordClient | None, state: State, dry_run: bool) -> None:
-    msg = ("YouTube の Cookie が無効になっています（ログイン状態になりません）。"
-           "メン限投稿は検知できません。Cookie を書き出し直して更新してください。")
-    log.warning(msg)
-    last = parse_time(state.alerts.get("cookie_invalid"))
-    if dry_run or discord is None or not cfg.state_channel_id:
+def _member_check_due(state: State, cfg: Config, yt: YouTubeClient, now: datetime) -> bool:
+    """Fallback-only: members-only checks run on their own schedule while the primary is
+    healthy, unless the primary already has working member cookies."""
+    if not yt.cookies_configured:
+        return False
+    primary = state.runners.get("primary", {})
+    if _fresh(primary.get("last_member_success"), now, cfg.fallback_after_minutes):
+        return False
+    last = state.runners.get("fallback", {}).get("last_member_check")
+    return not _fresh(last, now, cfg.member_check_minutes)
+
+
+def _in_github() -> bool:
+    return os.environ.get("GITHUB_ACTIONS") == "true"
+
+
+def _runner_label(role: str) -> str:
+    if _in_github():
+        return "GitHub Actions"
+    return "Mac（予備系）" if role == "fallback" else "この PC"
+
+
+COOKIE_PROBLEMS = {
+    "unreadable": "Cookie を読み込めません（{detail}）。",
+    "logged_out": "Cookie でログイン状態になりません。Cookie が失効した可能性があります。",
+    "not_member": "Cookie のアカウントはログインできていますが、チャンネルのメンバーではありません"
+                  "（メンバーシップが切れた可能性があります）。",
+    "fetch_failed": "メン限投稿のチェックが {streak} 回続けて失敗しています（{detail}）。"
+                    "YouTube の一時的な不調か、ページの形が変わった可能性があります。",
+}
+
+
+def _cookie_fix(role: str, status: str) -> str:
+    if status == "fetch_failed":
+        return ("しばらく様子を見て、続くようなら `uv run python -m achichi_notifier check` "
+                "で状態を確認してください。")
+    if _in_github():
+        return ("GitHub の Secret `YOUTUBE_COOKIES_B64` を更新するか、"
+                "Cookie を GitHub で使わないなら `gh secret delete YOUTUBE_COOKIES_B64` で削除してください。")
+    return ("Cookie を書き出し直して `~/Documents/DiscordBot_achichi/cookies.txt` に置き、"
+            "`./deploy/mac/install.sh` を再実行してください。")
+
+
+def _cookie_alert(cfg: Config, discord: DiscordClient | None, state: State, role: str,
+                  status: str, detail: str | None, dry_run: bool, streak: int = 0) -> None:
+    if status not in COOKIE_PROBLEMS:
         return
-    if last and datetime.now(timezone.utc) - last < COOKIE_ALERT_INTERVAL:
+    # Keep public Actions logs generic; the details go to the private state channel only.
+    shown = "see the state channel" if _in_github() else f"{status} ({detail})" if detail else status
+    log.warning("members-only check degraded: %s", shown)
+    if status == "fetch_failed" and streak < FETCH_FAIL_ALERT_STREAK:
         return
+    if dry_run or discord is None or cfg.state_backend != "discord" or not cfg.state_channel_id:
+        return
+    key = f"cookie:{role}:{status}"
+    if _fresh(state.alerts.get(key), datetime.now(timezone.utc), COOKIE_ALERT_INTERVAL.total_seconds() / 60):
+        return
+    message = (f"⚠️ **メン限投稿のチェックが止まっています**（{_runner_label(role)}）\n"
+               + COOKIE_PROBLEMS[status].format(detail=detail or "詳細不明", streak=streak)
+               + "\n動画・公開投稿の通知はこのまま続きます。\n対処: " + _cookie_fix(role, status))
     try:
-        discord.send(cfg.state_channel_id, {"content": f"⚠️ {msg}", "allowed_mentions": {"parse": []}})
-        state.alerts["cookie_invalid"] = now_iso()
+        discord.send(cfg.state_channel_id, {"content": message, "allowed_mentions": {"parse": []}})
+        state.alerts[key] = now_iso()
     except DiscordError as exc:
         log.warning("could not send cookie alert: %s", exc)
+
+
+class _RecentlyPosted:
+    """Last-line guard against duplicates (e.g. two runners racing on the shared state):
+    skip a notification whose link already appears in the channel's latest messages."""
+
+    def __init__(self, discord: DiscordClient):
+        self.discord = discord
+        self.cache: dict[str, set[str]] = {}
+
+    def contains(self, channel_id: str, url: str | None) -> bool:
+        if not url:
+            return False
+        if channel_id not in self.cache:
+            try:
+                self.cache[channel_id] = self.discord.recent_urls(channel_id)
+            except DiscordError as exc:
+                log.warning("could not read recent messages for the duplicate check: %s", exc)
+                self.cache[channel_id] = set()
+        return url in self.cache[channel_id]
 
 
 def run(cfg: Config, role: str = "primary", dry_run: bool = False) -> int:
@@ -201,41 +452,65 @@ def run(cfg: Config, role: str = "primary", dry_run: bool = False) -> int:
     if dry_run and cfg.state_backend == "discord" and discord is None:
         raise ConfigError("dry-run with Discord state needs DISCORD_BOT_TOKEN (or pass --state-file)")
     store = make_store(cfg, discord)
-    yt = YouTubeClient(cfg.youtube_channel_id, cfg.cookies_file)
+    yt = YouTubeClient.from_config(cfg)
 
     state = store.load()
     now = datetime.now(timezone.utc)
+    mode = "full"
     if role == "fallback" and _primary_is_fresh(state, cfg, now):
-        log.debug("primary runner is healthy; fallback skipped")
-        return 0
+        if not _member_check_due(state, cfg, yt, now):
+            log.debug("primary runner is healthy; fallback skipped")
+            return 0
+        mode = "members"
 
     notifier = Notifier(cfg, yt, now)
-    result = notifier.collect(state)
+    result = notifier.collect(state, mode)
     for error in result.errors:
         log.warning("source error: %s", error)
-    if yt.has_cookies and result.posts_logged_in is False:
-        _cookie_alert(cfg, discord, state, dry_run)
 
-    send_failures = 0
+    state.owner_role = role
+    runner = state.runners.setdefault(role, {})
+    if result.member_status is not None:
+        runner["last_member_check"] = now_iso()
+        if result.member_status == "ok":
+            runner["last_member_success"] = now_iso()
+        if result.member_status == "fetch_failed":
+            runner["member_fail_streak"] = int(runner.get("member_fail_streak") or 0) + 1
+        else:
+            runner["member_fail_streak"] = 0
+        _cookie_alert(cfg, discord, state, role, result.member_status, result.member_detail,
+                      dry_run, streak=int(runner.get("member_fail_streak") or 0))
+
+    recent = _RecentlyPosted(discord) if discord is not None and not dry_run else None
+    send_failures = skipped = 0
     for note in result.notifications:
+        channel = cfg.channel_ids.get(note.group)
         if dry_run:
-            print(f"--- [dry-run] {note.kind} -> channel {cfg.channel_ids.get(note.group, '(unset)')}")
+            print(f"--- [dry-run] {note.kind} -> channel {channel or '(unset)'}")
             print(json.dumps(note.payload, ensure_ascii=False, indent=2))
+        elif recent is not None and recent.contains(channel, note.url):
+            skipped += 1
+            log.info("this bot already posted that %s notification; not sending it again", note.kind)
+            target = state.videos if note.item_type == "video" else state.posts
+            target[note.item_id] = now_iso()
+            state.pending.pop(note.item_id, None)
+            continue
         else:
             try:
-                discord.send(cfg.channel_ids[note.group], note.payload)
+                discord.send(channel, note.payload)
             except DiscordError as exc:
                 send_failures += 1
-                log.error("failed to send %s %s: %s", note.item_type, note.item_id, exc)
+                log.error("failed to send a %s notification: %s", note.kind, exc)
                 continue
         target = state.videos if note.item_type == "video" else state.posts
         target[note.item_id] = now_iso()
-        log.info("%s %s %s", "would notify" if dry_run else "notified", note.kind, note.item_id)
+        state.pending.pop(note.item_id, None)
+        if note.kind != "member_post":
+            log.info("%s %s %s", "would notify" if dry_run else "notified", note.kind, note.item_id)
 
-    runner = state.runners.setdefault(role, {})
     runner["last_run"] = now_iso()
-    runner["host"] = "github-actions" if role == "primary" and _in_github() else platform.node()
-    if not result.errors and not send_failures:
+    runner["host"] = "github-actions" if _in_github() else "local"
+    if mode == "full" and not result.errors and not send_failures:
         runner["last_success"] = now_iso()
 
     if dry_run:
@@ -243,21 +518,17 @@ def run(cfg: Config, role: str = "primary", dry_run: bool = False) -> int:
         # the shared Discord state is never touched by a dry-run.
         if isinstance(store, FileStateStore):
             store.save(state)
-        log.info("dry-run: %d notification(s) printed, nothing posted", len(result.notifications))
+        log.info("dry-run (%s): %d notification(s) printed, nothing posted", mode, len(result.notifications))
         return 0
     store.save(state)
-    log.info("done: %d notified, %d source error(s), %d send failure(s)",
-             len(result.notifications) - send_failures, len(result.errors), send_failures)
+    log.info("done (%s): %d notified, %d already posted, %d source error(s), %d send failure(s)", mode,
+             len(result.notifications) - send_failures - skipped, skipped, len(result.errors), send_failures)
     return 1 if send_failures else 0
-
-
-def _in_github() -> bool:
-    return os.environ.get("GITHUB_ACTIONS") == "true"
 
 
 def preview(cfg: Config, send: bool = False) -> int:
     """Render the latest item of each type regardless of state (to check formatting)."""
-    yt = YouTubeClient(cfg.youtube_channel_id, cfg.cookies_file)
+    yt = YouTubeClient.from_config(cfg)
     notifier = Notifier(cfg, yt)
     result = CollectResult()
     refs = notifier.collect_video_refs(result)
@@ -270,20 +541,29 @@ def preview(cfg: Config, send: bool = False) -> int:
         info = yt.fetch_video_info(ref)
         notes.append(Notification(info.kind, "video", ref.video_id, notifier.now,
                                   render.video_payload(info, result.meta, None)))
+    member_page = notifier._fetch_member_page(result)
     try:
-        page = yt.fetch_posts()
-        posts: list[Post] = page.posts
-        result.meta = result.meta or page.meta
-        log.info("posts page: %d posts, logged_in=%s", len(posts), page.logged_in)
-        first_public = next((p for p in posts if not p.members_only), None)
-        first_member = next((p for p in posts if p.members_only), None)
-        for post in (first_public, first_member):
-            if post:
-                kind = "member_post" if post.members_only else "post"
-                notes.append(Notification(kind, "post", post.post_id, notifier.now,
-                                          render.post_payload(post, result.meta, None)))
+        public_page = yt.fetch_posts_page(member=False)
     except YouTubeError as exc:
         result.errors.append(f"posts: {exc}")
+        public_page = None
+    if public_page is not None and not public_page.logged_in:
+        result.meta = result.meta or public_page.meta
+        first_public = next((p for p in public_page.posts if not p.members_only), None)
+        if first_public:
+            notes.append(Notification("post", "post", first_public.post_id, notifier.now,
+                                      render.post_payload(first_public, result.meta, None)))
+    if member_page is not None:
+        comparable = comparable_public_page(public_page, member_page)
+        if not member_page_problem(member_page, comparable):
+            badge, by_comparison = classify_member_posts(member_page, comparable)
+            members = badge or by_comparison
+            if members:
+                notes.append(Notification("member_post", "post", members[0].post_id, notifier.now,
+                                          render.post_payload(replace(members[0], members_only=True),
+                                                              result.meta, None)))
+    if result.member_status and result.member_status != "ok":
+        log.warning("members-only check: %s", result.member_status)
     for error in result.errors:
         log.warning("source error: %s", error)
 
@@ -294,9 +574,9 @@ def preview(cfg: Config, send: bool = False) -> int:
             payload = dict(note.payload)
             payload["content"] = "【プレビュー】" + payload["content"]
             discord.send(cfg.channel_ids[note.group], payload)
-            log.info("sent preview %s %s", note.kind, note.item_id)
+            log.info("sent preview %s", note.kind)
     else:
         for note in notes:
-            print(f"--- [preview] {note.kind} {note.item_id}")
+            print(f"--- [preview] {note.kind}")
             print(json.dumps(note.payload, ensure_ascii=False, indent=2))
     return 1 if result.errors and not notes else 0

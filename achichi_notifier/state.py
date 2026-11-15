@@ -19,9 +19,12 @@ from .discord_api import DiscordClient, DiscordError
 
 log = logging.getLogger(__name__)
 
-STATE_VERSION = 1
+STATE_VERSION = 2
 STATE_FILENAME = "achichi-notifier-state.json"
 MAX_ENTRIES = 1500
+PENDING_TTL_HOURS = 72
+BACKLOG_PREFIX = "backlog@"  # pending entries recorded at the members-only comparison baseline
+KNOWN_KEYS = {"version", "videos", "posts", "seeded", "runners", "alerts", "pending"}
 
 
 def now_iso() -> str:
@@ -47,10 +50,20 @@ def _max_iso(a: str | None, b: str | None) -> str | None:
 @dataclass
 class State:
     videos: dict[str, str] = field(default_factory=dict)  # video_id -> first seen
-    posts: dict[str, str] = field(default_factory=dict)  # post_id -> first seen
+    posts: dict[str, str] = field(default_factory=dict)  # post_id -> first seen / announced
     seeded: dict[str, str] = field(default_factory=dict)  # scope -> when seeded
-    runners: dict[str, dict[str, str]] = field(default_factory=dict)  # role -> times
+    runners: dict[str, dict] = field(default_factory=dict)  # role -> times / counters
     alerts: dict[str, str] = field(default_factory=dict)  # alert key -> last sent
+    # Posts that looked members-only only by comparison (no badge); announced after a
+    # second confirming observation. post_id -> first seen.
+    pending: dict[str, str] = field(default_factory=dict)
+    # Unknown top-level keys written by a newer version are carried through untouched,
+    # so an older copy of the bot (e.g. on the Mac) never erases them.
+    extra: dict = field(default_factory=dict)
+    # The role that is saving this state (not persisted). Each role's runner entry is
+    # written only by that role, so on merge the other roles' entries come from the
+    # freshly loaded copy instead of this run's possibly stale snapshot.
+    owner_role: str | None = field(default=None, compare=False)
 
     @classmethod
     def from_dict(cls, data: dict) -> State:
@@ -60,26 +73,34 @@ class State:
             seeded=dict(data.get("seeded") or {}),
             runners={k: dict(v) for k, v in (data.get("runners") or {}).items()},
             alerts=dict(data.get("alerts") or {}),
+            pending=dict(data.get("pending") or {}),
+            extra={k: v for k, v in data.items() if k not in KNOWN_KEYS},
         )
 
     def to_dict(self) -> dict:
         return {
+            **self.extra,
             "version": STATE_VERSION,
             "videos": self.videos,
             "posts": self.posts,
             "seeded": self.seeded,
             "runners": self.runners,
             "alerts": self.alerts,
+            "pending": self.pending,
         }
 
     def merge_from(self, other: State) -> None:
         """Union with a concurrently written state (keeps everything either side has seen)."""
-        for mine, theirs in ((self.videos, other.videos), (self.posts, other.posts)):
+        for mine, theirs in ((self.videos, other.videos), (self.posts, other.posts),
+                             (self.pending, other.pending)):
             for key, value in theirs.items():
                 mine.setdefault(key, value)
         for key, value in other.seeded.items():
             self.seeded.setdefault(key, value)
         for role, times in other.runners.items():
+            if self.owner_role is not None and role != self.owner_role:
+                self.runners[role] = dict(times)
+                continue
             mine = self.runners.setdefault(role, {})
             for key, value in times.items():
                 if key.startswith("last_"):
@@ -88,6 +109,10 @@ class State:
                     mine.setdefault(key, value)
         for key, value in other.alerts.items():
             self.alerts[key] = _max_iso(self.alerts.get(key), value)
+        self.extra.update(other.extra)  # this version never edits extra; newest copy wins
+        # A pending post that either side has since announced or seen publicly is settled.
+        for key in [k for k in self.pending if k in self.posts]:
+            del self.pending[key]
 
     def prune(self, limit: int = MAX_ENTRIES) -> None:
         for name in ("videos", "posts"):
@@ -95,6 +120,10 @@ class State:
             if len(items) > limit:
                 newest = sorted(items.items(), key=lambda kv: kv[1], reverse=True)[:limit]
                 setattr(self, name, dict(newest))
+        cutoff = datetime.now(timezone.utc).timestamp() - PENDING_TTL_HOURS * 3600
+        self.pending = {k: v for k, v in self.pending.items()
+                        if (t := parse_time(v.removeprefix(BACKLOG_PREFIX))) is None
+                        or t.timestamp() >= cutoff}
 
     def dumps(self) -> bytes:
         return json.dumps(self.to_dict(), ensure_ascii=False, indent=1, sort_keys=True).encode()

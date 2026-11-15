@@ -197,3 +197,43 @@ def test_state_merge_and_prune():
     assert "fallback" in a.runners
     a.prune(limit=1)
     assert list(a.videos) == ["v2"]
+
+
+def test_parse_posts_post_renderer_shared_member_original_and_locked_teaser():
+    from achichi_notifier.youtube import parse_posts_detailed
+    data = _tab_data([
+        {"backstagePostThreadRenderer": {"post": {"postRenderer": {
+            "postId": "UgkxPOSTRENDERER", "contentText": {"runs": [{"text": "x"}]},
+            "sponsorsOnlyBadge": {"sponsorsOnlyBadgeRenderer": {"label": {"simpleText": "メンバー限定"}}}}}}},
+        {"backstagePostThreadRenderer": {"post": {"sharedPostRenderer": {
+            "postId": "UgkxSHAREDMEM", "content": {"runs": [{"text": "共有コメント"}]},
+            "originalPost": {"backstagePostRenderer": {
+                "postId": "UgkxORIGINALMEM", "contentText": {"runs": [{"text": "ひみつ"}]},
+                "sponsorsOnlyBadge": {"sponsorsOnlyBadgeRenderer": {}}}}}}}},
+        {"backstageLockedPostViewModel": {
+            "publishedTimeText": {"content": "1 時間前"},
+            "commentButton": {"buttonViewModel": {"onTap": {"innertubeCommand": {
+                "commandMetadata": {"webCommandMetadata": {"url": "/post/UgkxLOCKEDTEASER1"}}}}}}}},
+        {"backstageLockedPostViewModel": {"lockedText": {"content": "メンバー限定"}}},
+    ])
+    posts, locked_without_id = parse_posts_detailed(data)
+    by_id = {p.post_id: p for p in posts}
+    assert set(by_id) == {"UgkxPOSTRENDERER", "UgkxSHAREDMEM", "UgkxLOCKEDTEASER1"}
+    assert all(p.members_only for p in posts)
+    assert locked_without_id == 1
+    payload = render.post_payload(by_id["UgkxSHAREDMEM"], None, None)
+    assert "共有コメント" not in repr(payload) and "ひみつ" not in repr(payload)
+
+
+def test_membership_status_and_posts_section():
+    from achichi_notifier.youtube import membership_status, posts_section_present
+
+    def header(title):
+        return {"header": {"pageHeaderRenderer": {"content": {"buttons": [{"buttonViewModel": {
+            "title": title, "iconName": "SPONSORSHIP_STAR"}}]}}}}
+
+    assert membership_status(header("メンバー特典")) == "member"
+    assert membership_status(header("メンバーになる")) == "not_member"
+    assert membership_status({"header": {}}) == "unknown"
+    assert posts_section_present(_tab_data([{"continuationItemRenderer": {}}]))
+    assert not posts_section_present(_tab_data([{"messageRenderer": {}}]))

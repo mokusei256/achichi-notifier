@@ -72,6 +72,21 @@ class DiscordClient:
             params["before"] = before
         return self._request("GET", f"/channels/{channel_id}/messages", params=params)
 
+    def recent_urls(self, channel_id: str, limit: int = 50) -> set[str]:
+        """Embed links of this bot's own recent notifications in the channel. Links posted
+        by people or other bots, and the bot's 【プレビュー】 messages, are ignored."""
+        bot_id = self.me()["id"]
+        urls: set[str] = set()
+        for message in self.messages(channel_id, limit=limit):
+            if message.get("author", {}).get("id") != bot_id:
+                continue
+            if (message.get("content") or "").startswith("【プレビュー】"):
+                continue
+            for embed in message.get("embeds") or []:
+                if embed.get("url"):
+                    urls.add(embed["url"])
+        return urls
+
     def _file_parts(self, content: str, filename: str, data: bytes) -> dict:
         payload = {
             "content": content,

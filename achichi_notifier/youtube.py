@@ -13,10 +13,10 @@ import http.cookiejar
 import json
 import logging
 import re
+import time
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any, Iterator
 from urllib.parse import parse_qs, urlparse
 
@@ -101,13 +101,6 @@ class Post:
     @property
     def url(self) -> str:
         return f"{BASE}/post/{self.post_id}"
-
-
-@dataclass
-class PostsPage:
-    posts: list[Post]
-    logged_in: bool
-    meta: ChannelMeta | None
 
 
 # --------------------------------------------------------------------------- helpers
@@ -414,14 +407,22 @@ def classify_video(player: dict | None, ref: VideoRef) -> VideoInfo:
     )
 
 
-def _parse_post_renderer(post: dict, shared: bool) -> Post | None:
-    post_id = post.get("postId")
-    if not post_id:
-        return None
-    members_only = any(
+def _is_members_only_renderer(post: dict) -> bool:
+    """A post renderer carries the members-only badge (sponsorsOnlyBadge.sponsorsOnlyBadgeRenderer,
+    verified on a real member page) or any similarly named flag."""
+    if post.get("sponsorsOnlyBadge"):
+        return True
+    return any(
         value and key.lower().startswith(("sponsorsonly", "membersonly"))
         for key, value in post.items()
     )
+
+
+def _parse_post_renderer(post: dict, shared: bool, force_members: bool = False) -> Post | None:
+    post_id = post.get("postId")
+    if not post_id:
+        return None
+    members_only = force_members or _is_members_only_renderer(post)
     text = text_of(post.get("contentText") or post.get("content"))
     image = poll = video_id = None
     attachment = post.get("backstageAttachment") or {}
@@ -445,54 +446,203 @@ def _parse_post_renderer(post: dict, shared: bool) -> Post | None:
     )
 
 
-def parse_posts(data: dict) -> list[Post]:
+_POST_ID_IN_JSON = (
+    re.compile(r'"postId"\s*:\s*"(Ug[A-Za-z0-9_-]{10,})"'),
+    re.compile(r"/post/(Ug[A-Za-z0-9_-]{10,})"),
+)
+
+
+def _locked_post(view_model: dict) -> Post | None:
+    """backstageLockedPostViewModel: a locked members-only teaser (no postId field)."""
+    blob = json.dumps(view_model, ensure_ascii=False)
+    for pattern in _POST_ID_IN_JSON:
+        if match := pattern.search(blob):
+            return Post(post_id=match.group(1), members_only=True,
+                        published_text=text_of(view_model.get("publishedTimeText")) or None)
+    return None
+
+
+def parse_posts_detailed(data: dict) -> tuple[list[Post], int]:
+    """Return (posts, number of locked members-only teasers whose id could not be found)."""
     posts: list[Post] = []
     seen: set[str] = set()
+    locked_without_id = 0
     content = _selected_tab_content(data)
-    threads = [n["backstagePostThreadRenderer"] for n in _walk(content)
-               if isinstance(n.get("backstagePostThreadRenderer"), dict)]
-    candidates: list[tuple[dict, bool]] = []
-    if threads:
-        for thread in threads:
+    candidates: list[tuple[dict, bool, bool]] = []
+    found_thread = False
+    for node in _walk(content):
+        thread = node.get("backstagePostThreadRenderer")
+        if isinstance(thread, dict):
+            found_thread = True
             wrapper = thread.get("post") or {}
-            if isinstance(r := wrapper.get("backstagePostRenderer"), dict):
-                candidates.append((r, False))
-            elif isinstance(r := wrapper.get("sharedPostRenderer"), dict):
-                candidates.append((r, True))
-    else:  # unknown layout: take top-level post renderers only
+            for key in ("backstagePostRenderer", "postRenderer"):
+                if isinstance(renderer := wrapper.get(key), dict):
+                    candidates.append((renderer, False, False))
+                    break
+            else:
+                if isinstance(shared := wrapper.get("sharedPostRenderer"), dict):
+                    original = shared.get("originalPost") or {}
+                    original_members = any(
+                        isinstance(o := original.get(k), dict) and _is_members_only_renderer(o)
+                        for k in ("backstagePostRenderer", "postRenderer")
+                    )
+                    candidates.append((shared, True, original_members))
+        locked = node.get("backstageLockedPostViewModel")
+        if isinstance(locked, dict):
+            post = _locked_post(locked)
+            if post is None:
+                locked_without_id += 1
+            elif post.post_id not in seen:
+                seen.add(post.post_id)
+                posts.append(post)
+    if not found_thread:  # unknown layout: take top-level post renderers only
         for node in _walk(content):
-            if isinstance(r := node.get("backstagePostRenderer"), dict):
-                candidates.append((r, False))
-    for renderer, shared in candidates:
-        post = _parse_post_renderer(renderer, shared)
+            for key in ("backstagePostRenderer", "postRenderer"):
+                if isinstance(renderer := node.get(key), dict):
+                    candidates.append((renderer, False, False))
+    for renderer, shared, force_members in candidates:
+        post = _parse_post_renderer(renderer, shared, force_members)
         if post and post.post_id not in seen:
             seen.add(post.post_id)
             posts.append(post)
-    return posts
+    return posts, locked_without_id
+
+
+def parse_posts(data: dict) -> list[Post]:
+    return parse_posts_detailed(data)[0]
+
+
+def posts_section_present(data: dict) -> bool:
+    """The posts tab rendered a post list (possibly empty with only a continuation)."""
+    markers = ("backstagePostThreadRenderer", "backstageLockedPostViewModel", "continuationItemRenderer")
+    return any(any(k in node for k in markers) for node in _walk(_selected_tab_content(data)))
+
+
+MEMBER_BUTTON_TITLES = ("メンバー特典", "特典を表示", "Perks", "View perks")
+JOIN_BUTTON_TITLES = ("メンバーになる", "Join")
+
+
+def membership_status(data: dict) -> str:
+    """From the channel header's membership button: "member" / "not_member" / "unknown".
+    Verified on real pages: members see 「メンバー特典」, others 「メンバーになる」."""
+    for node in _walk(data.get("header") or {}):
+        button = node.get("buttonViewModel")
+        if isinstance(button, dict) and button.get("iconName") == "SPONSORSHIP_STAR":
+            title = (button.get("title") or "").strip()
+            if title in MEMBER_BUTTON_TITLES:
+                return "member"
+            if title in JOIN_BUTTON_TITLES:
+                return "not_member"
+    return "unknown"
+
+
+# --------------------------------------------------------------------------- cookies
+
+AUTH_COOKIE_NAMES = ("SAPISID", "__Secure-1PAPISID", "__Secure-3PAPISID")
+
+
+@dataclass
+class CookieLoad:
+    jar: requests.cookies.RequestsCookieJar
+    kept: int = 0
+    malformed_lines: int = 0
+    other_domains: int = 0
+
+
+def parse_cookie_text(text: str) -> CookieLoad:
+    """Parse Netscape cookies.txt leniently (header optional, BOM/CRLF tolerated,
+    #HttpOnly_ prefix, expires=0 -> session cookie). Only youtube.com cookies are kept.
+    Never puts cookie names or values into errors or logs."""
+    result = CookieLoad(jar=requests.cookies.RequestsCookieJar())
+    text = text.lstrip("﻿").replace("\r\n", "\n").replace("\r", "\n")
+    for raw in text.split("\n"):
+        line = raw.strip()
+        if not line:
+            continue
+        http_only = line.startswith("#HttpOnly_")
+        if http_only:
+            line = line[len("#HttpOnly_"):]
+        elif line.startswith("#"):
+            continue
+        fields = line.split("\t")
+        if len(fields) != 7:
+            result.malformed_lines += 1
+            continue
+        domain, _subdomains, path, secure, expires, name, value = fields
+        if not _printable_ascii(name) or not _printable_ascii(value) or not name:
+            result.malformed_lines += 1
+            continue
+        bare = domain.lstrip(".").lower()
+        if bare != "youtube.com" and not bare.endswith(".youtube.com"):
+            result.other_domains += 1
+            continue
+        expires = expires.strip()
+        if expires in ("", "0"):
+            expiry = None
+        elif expires.isdigit():
+            expiry = int(expires)
+        else:
+            result.malformed_lines += 1
+            continue
+        result.jar.set_cookie(http.cookiejar.Cookie(
+            version=0, name=name, value=value, port=None, port_specified=False,
+            domain=domain, domain_specified=domain.startswith("."),
+            domain_initial_dot=domain.startswith("."), path=path or "/", path_specified=True,
+            secure=secure.strip().upper() == "TRUE", expires=expiry, discard=expiry is None,
+            comment=None, comment_url=None, rest={"HttpOnly": None} if http_only else {},
+        ))
+        result.kept += 1
+    return result
+
+
+def _printable_ascii(text: str) -> bool:
+    return all(0x20 < ord(ch) < 0x7F for ch in text)
+
+
+def has_auth_cookies(jar) -> bool:
+    names = {cookie.name for cookie in jar}
+    return "LOGIN_INFO" in names and any(n in names for n in AUTH_COOKIE_NAMES)
 
 
 # --------------------------------------------------------------------------- client
 
 
-def _load_cookie_jar(path: Path) -> http.cookiejar.MozillaCookieJar:
-    jar = http.cookiejar.MozillaCookieJar(str(path))
-    try:
-        jar.load(ignore_discard=True, ignore_expires=True)
-    except (OSError, http.cookiejar.LoadError) as exc:
-        raise YouTubeError(f"cannot read cookies file ({exc.__class__.__name__})") from exc
-    return jar
+@dataclass
+class PostsPage:
+    posts: list[Post]
+    logged_in: bool
+    meta: ChannelMeta | None
+    valid: bool = True  # the post list itself was rendered
+    membership: str = "unknown"  # member | not_member | unknown (only meaningful when logged in)
+    locked_without_id: int = 0
 
 
 class YouTubeClient:
-    def __init__(self, channel_id: str, cookies_file: Path | None = None, timeout: float = 20.0):
+    def __init__(self, channel_id: str, cookie_text: str | None = None,
+                 cookie_error: str | None = None, timeout: float = 20.0):
         self.channel_id = channel_id
         self.timeout = timeout
         self.session = self._new_session()
         self.session.cookies.set("SOCS", "CAI", domain=".youtube.com")  # skip consent wall
+        self.cookies_configured = bool(cookie_text or cookie_error)
+        self.cookie_error = cookie_error
         self.member_session: requests.Session | None = None
-        if cookies_file:
-            self.member_session = self._new_session()
-            self.member_session.cookies = _load_cookie_jar(cookies_file)
+        if cookie_text and not cookie_error:
+            loaded = parse_cookie_text(cookie_text)
+            if loaded.malformed_lines:
+                log.warning("ignored %d malformed cookie line(s)", loaded.malformed_lines)
+            if not has_auth_cookies(loaded.jar):
+                self.cookie_error = "no YouTube login cookies (LOGIN_INFO / SAPISID) in the cookie data"
+            else:
+                if "SOCS" not in {c.name for c in loaded.jar}:
+                    loaded.jar.set("SOCS", "CAI", domain=".youtube.com")
+                self.member_session = self._new_session()
+                self.member_session.cookies = loaded.jar
+
+    @classmethod
+    def from_config(cls, cfg) -> YouTubeClient:
+        text, error = cfg.read_cookie_text()
+        return cls(cfg.youtube_channel_id, text, error)
 
     @staticmethod
     def _new_session() -> requests.Session:
@@ -510,24 +660,35 @@ class YouTubeClient:
     def _get(self, url: str, session: requests.Session | None = None, **params: str) -> str:
         try:
             resp = (session or self.session).get(url, params=params or None, timeout=self.timeout)
-        except requests.RequestException as exc:
-            raise YouTubeError(f"GET {url} failed: {exc.__class__.__name__}") from exc
+        except (requests.RequestException, ValueError) as exc:
+            # ValueError covers header encoding errors; never include the exception text,
+            # which could quote cookie characters.
+            raise YouTubeError(f"GET {urlparse(url).path} failed: {exc.__class__.__name__}") from None
         if resp.status_code != 200:
-            raise YouTubeError(f"GET {url} -> HTTP {resp.status_code}")
+            raise YouTubeError(f"GET {urlparse(url).path} -> HTTP {resp.status_code}")
         return resp.text
 
-    def _tab_url(self, tab: str) -> str:
-        return f"{BASE}/channel/{self.channel_id}/{tab}"
+    def _get_initial_data(self, path: str, session: requests.Session | None = None,
+                          **params: str) -> tuple[str, dict]:
+        """YouTube occasionally serves a page variant without ytInitialData; retry once."""
+        for attempt in range(2):
+            html = self._get(BASE + path, session=session, hl="ja", gl="JP", **params)
+            data = extract_initial_data(html)
+            if data is not None:
+                return html, data
+            if attempt == 0:
+                time.sleep(2)
+        raise YouTubeError(f"ytInitialData not found on {path}")
+
+    def _tab_path(self, tab: str) -> str:
+        return f"/channel/{self.channel_id}/{tab}"
 
     def fetch_rss(self) -> tuple[list[VideoRef], str | None]:
         xml_text = self._get(f"{BASE}/feeds/videos.xml", channel_id=self.channel_id)
         return parse_rss(xml_text)
 
     def fetch_tab(self, tab: str) -> tuple[list[VideoRef], ChannelMeta | None]:
-        html = self._get(self._tab_url(tab), hl="ja", gl="JP")
-        data = extract_initial_data(html)
-        if data is None:
-            raise YouTubeError(f"ytInitialData not found on /{tab}")
+        _, data = self._get_initial_data(self._tab_path(tab))
         return parse_tab_videos(data, tab), parse_channel_meta(data)
 
     def fetch_video_info(self, ref: VideoRef) -> VideoInfo:
@@ -543,10 +704,18 @@ class YouTubeClient:
                 log.warning("watch page for %s asks for sign-in (bot check?)", ref.video_id)
         return classify_video(player, ref)
 
-    def fetch_posts(self) -> PostsPage:
-        session = self.member_session or self.session
-        html = self._get(self._tab_url("posts"), session=session, hl="ja", gl="JP")
-        data = extract_initial_data(html)
-        if data is None:
-            raise YouTubeError("ytInitialData not found on /posts")
-        return PostsPage(parse_posts(data), is_logged_in(html), parse_channel_meta(data))
+    def fetch_posts_page(self, member: bool = False) -> PostsPage:
+        """The posts tab, logged out (default) or with the member's cookies."""
+        if member and self.member_session is None:
+            raise YouTubeError("no usable member cookies")
+        session = self.member_session if member else self.session
+        html, data = self._get_initial_data(self._tab_path("posts"), session=session)
+        posts, locked_without_id = parse_posts_detailed(data)
+        return PostsPage(
+            posts=posts,
+            logged_in=is_logged_in(html),
+            meta=parse_channel_meta(data),
+            valid=posts_section_present(data),
+            membership=membership_status(data),
+            locked_without_id=locked_without_id,
+        )

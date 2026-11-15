@@ -5,7 +5,6 @@ from __future__ import annotations
 import base64
 import binascii
 import os
-import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -54,16 +53,28 @@ def _env_number(name: str, default: float, cast=int):
         raise ConfigError(f"{name} must be a number (got {raw!r})") from exc
 
 
-def _cookies_from_b64(b64: str) -> Path:
+def _decode_text(data: bytes) -> tuple[str | None, str | None]:
     try:
-        content = base64.b64decode(b64, validate=False)
-    except (binascii.Error, ValueError) as exc:
-        raise ConfigError("YOUTUBE_COOKIES_B64 is not valid base64") from exc
-    fd, name = tempfile.mkstemp(prefix="yt-cookies-", suffix=".txt")
-    with os.fdopen(fd, "wb") as fh:
-        fh.write(content)
-    os.chmod(name, 0o600)
-    return Path(name)
+        return data.decode("utf-8-sig"), None
+    except UnicodeDecodeError:
+        return None, "cookie data is not UTF-8 text"
+
+
+def decode_cookie_secret(value: str) -> tuple[str | None, str | None]:
+    """YOUTUBE_COOKIES_B64 may hold base64 (std or url-safe, wrapped or not) or the raw
+    cookies.txt text. Returns (text, error); errors never contain cookie values."""
+    stripped = value.strip().lstrip("\ufeff")
+    if stripped.startswith("#") or "\t" in stripped:
+        return stripped, None
+    compact = "".join(stripped.split())
+    compact += "=" * (-len(compact) % 4)
+    for altchars in (None, b"-_"):
+        try:
+            raw = base64.b64decode(compact, altchars=altchars, validate=True)
+        except (binascii.Error, ValueError):
+            continue
+        return _decode_text(raw)
+    return None, "YOUTUBE_COOKIES_B64 is neither base64 nor cookies.txt text"
 
 
 @dataclass(frozen=True)
@@ -76,10 +87,12 @@ class Config:
     youtube_channel_id: str
     youtube_handle: str
     cookies_file: Path | None
+    cookies_secret: str | None
     mentions: dict[str, str]
     fallback_after_minutes: int
     max_age_hours: float
     max_new_per_run: int
+    member_check_minutes: int
 
     @classmethod
     def from_env(cls) -> Config:
@@ -101,14 +114,7 @@ class Config:
         if backend not in ("discord", "file"):
             raise ConfigError("STATE_BACKEND must be 'discord' or 'file'")
 
-        cookies_path: Path | None = None
         cookies_file = _env("YOUTUBE_COOKIES_FILE")
-        if cookies_file:
-            cookies_path = Path(cookies_file).expanduser()
-            if not cookies_path.is_file():
-                raise ConfigError(f"YOUTUBE_COOKIES_FILE not found: {cookies_path}")
-        elif b64 := _env("YOUTUBE_COOKIES_B64"):
-            cookies_path = _cookies_from_b64(b64)
 
         return cls(
             discord_token=_env("DISCORD_BOT_TOKEN"),
@@ -118,12 +124,31 @@ class Config:
             state_file=Path(_env("STATE_FILE", "state.json")).expanduser(),
             youtube_channel_id=_env("YOUTUBE_CHANNEL_ID", DEFAULT_YOUTUBE_CHANNEL_ID),
             youtube_handle=_env("YOUTUBE_HANDLE", DEFAULT_YOUTUBE_HANDLE),
-            cookies_file=cookies_path,
+            cookies_file=Path(cookies_file).expanduser() if cookies_file else None,
+            cookies_secret=None if cookies_file else _env("YOUTUBE_COOKIES_B64"),
             mentions=mentions,
             fallback_after_minutes=_env_number("FALLBACK_AFTER_MINUTES", 15),
             max_age_hours=_env_number("MAX_AGE_HOURS", 72.0, float),
             max_new_per_run=_env_number("MAX_NEW_PER_RUN", 10),
+            member_check_minutes=_env_number("MEMBER_CHECK_MINUTES", 10),
         )
+
+    @property
+    def cookies_configured(self) -> bool:
+        return bool(self.cookies_file or self.cookies_secret)
+
+    def read_cookie_text(self) -> tuple[str | None, str | None]:
+        """Return (cookies.txt text, error). A broken cookie setup must never stop the
+        rest of the bot, so problems are reported instead of raised."""
+        if self.cookies_file:
+            try:
+                data = self.cookies_file.read_bytes()
+            except OSError as exc:
+                return None, f"cookie file unreadable ({exc.__class__.__name__})"
+            return _decode_text(data)
+        if self.cookies_secret:
+            return decode_cookie_secret(self.cookies_secret)
+        return None, None
 
     def require_discord(self) -> None:
         if not self.discord_token:

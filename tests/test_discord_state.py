@@ -1,3 +1,5 @@
+import json
+
 from achichi_notifier.state import STATE_FILENAME, DiscordStateStore, State
 
 
@@ -51,3 +53,46 @@ def test_discord_state_roundtrip_create_then_edit():
     store.save(State(videos={"v2": "2026-11-15T01:00:00+00:00"}))
     final = DiscordStateStore(fake, "state-channel").load()
     assert set(final.videos) == {"v1", "v2"} and set(final.posts) == {"p1"}
+
+
+def test_merge_takes_other_roles_from_the_fresh_copy_and_newest_extra():
+    stale = State(runners={"primary": {"last_run": "2026-11-15T00:00:00+00:00"},
+                           "fallback": {"member_fail_streak": 5}},
+                  extra={"future": {"v": 1}})
+    stale.owner_role = "primary"
+    fresh = State(runners={"fallback": {"member_fail_streak": 0,
+                                        "last_member_check": "2026-11-15T00:10:00+00:00"}},
+                  extra={"future": {"v": 2}})
+    stale.merge_from(fresh)
+    assert stale.runners["fallback"]["member_fail_streak"] == 0
+    assert stale.runners["primary"]["last_run"] == "2026-11-15T00:00:00+00:00"
+    assert stale.extra == {"future": {"v": 2}}
+
+
+def test_unknown_keys_survive_a_round_trip():
+    state = State.from_dict({"videos": {}, "streams": {"abc": {"status": "live"}}})
+    assert State.from_dict(json.loads(state.dumps()))  # still loads
+    assert json.loads(state.dumps())["streams"] == {"abc": {"status": "live"}}
+
+
+def test_recent_urls_only_counts_this_bots_real_notifications():
+    from achichi_notifier.discord_api import DiscordClient
+
+    class Client(DiscordClient):
+        def __init__(self):
+            pass
+
+        def me(self):
+            return {"id": "bot"}
+
+        def messages(self, channel_id, limit=100, before=None):
+            return [
+                {"author": {"id": "fan"}, "content": "https://www.youtube.com/watch?v=FANLINK0001",
+                 "embeds": [{"url": "https://www.youtube.com/watch?v=FANLINK0001"}]},
+                {"author": {"id": "bot"}, "content": "【プレビュー】📅 配信枠",
+                 "embeds": [{"url": "https://www.youtube.com/watch?v=PREVIEW0001"}]},
+                {"author": {"id": "bot"}, "content": "📅 配信枠が作成されました",
+                 "embeds": [{"url": "https://www.youtube.com/watch?v=REALNOTE001"}]},
+            ]
+
+    assert Client().recent_urls("1") == {"https://www.youtube.com/watch?v=REALNOTE001"}

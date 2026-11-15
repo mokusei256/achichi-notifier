@@ -2,7 +2,7 @@ name: notify
 
 on:
   schedule:
-    - cron: "*/5 * * * *"   # check (GitHub may delay scheduled runs by several minutes)
+    - cron: "2-57/5 * * * *"  # every 5 min, offset from :00 (GitHub delays runs most at the top of the hour)
     - cron: "23 3 * * 1"    # weekly keepalive check (see keepalive job)
   workflow_dispatch:
 
@@ -19,10 +19,13 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 8
     steps:
-      - uses: actions/checkout@v4
-
-      - uses: astral-sh/setup-uv@v6
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
+          persist-credentials: false
+
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
+        with:
+          version: "0.11.17"   # same uv that produced uv.lock
           enable-cache: true
 
       - name: Install
@@ -31,6 +34,7 @@ jobs:
       - name: Check YouTube and post to Discord
         env:
           DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
+          # Optional and not recommended (README: cookies belong on the Mac). Unset = no member check here.
           YOUTUBE_COOKIES_B64: ${{ secrets.YOUTUBE_COOKIES_B64 }}
           DISCORD_CHANNEL_ID: ${{ vars.DISCORD_CHANNEL_ID }}
           DISCORD_STATE_CHANNEL_ID: ${{ vars.DISCORD_STATE_CHANNEL_ID }}
@@ -59,7 +63,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Empty commit if the repository has been quiet for 45 days
         run: |
           last=$(git log -1 --format=%ct)

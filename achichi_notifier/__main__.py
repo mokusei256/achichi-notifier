@@ -73,10 +73,9 @@ def _check(cfg: Config) -> int:
                         continue
                     perms = channel.permissions_for(channel.guild.me)
                     need = {"view_channel": "チャンネルを見る", "send_messages": "メッセージを送信",
-                            "embed_links": "埋め込みリンク"}
+                            "embed_links": "埋め込みリンク", "read_message_history": "メッセージ履歴を読む"}
                     if label == "状態保存":
-                        need.update({"read_message_history": "メッセージ履歴を読む",
-                                     "attach_files": "ファイルを添付"})
+                        need["attach_files"] = "ファイルを添付"
                     missing = [name for attr, name in need.items() if not getattr(perms, attr)]
                     if missing:
                         problems.append(f"{label} #{channel.name}: 権限不足 → " + ", ".join(missing))
@@ -95,18 +94,42 @@ def _check(cfg: Config) -> int:
     except discord.HTTPException as exc:
         problems.append(f"Discord: 接続エラー ({exc.status})")
 
-    yt = YouTubeClient(cfg.youtube_channel_id, cfg.cookies_file)
+    from .notifier import classify_member_posts, comparable_public_page, member_page_problem
+
+    yt = YouTubeClient.from_config(cfg)
+    public_page = None
     try:
         refs, title = yt.fetch_rss()
         print(f"✅ YouTube RSS: {title} / {len(refs)} 件")
-        page = yt.fetch_posts()
-        print(f"✅ YouTube 投稿タブ: {len(page.posts)} 件 / ログイン状態={page.logged_in}")
-        if yt.has_cookies and not page.logged_in:
-            problems.append("Cookie が設定されていますがログイン状態になりません（失効の可能性）")
-        if not yt.has_cookies:
-            print("ℹ️  Cookie 未設定: メン限投稿は検知されません")
+        public_page = yt.fetch_posts_page(member=False)
+        print(f"✅ YouTube 投稿タブ（ログアウト表示）: {len(public_page.posts)} 件")
     except YouTubeError as exc:
         problems.append(f"YouTube: {exc}")
+    if not yt.cookies_configured:
+        print("ℹ️  Cookie 未設定: メン限投稿は検知されません")
+    elif yt.cookie_error or not yt.has_cookies:
+        problems.append(f"Cookie: {yt.cookie_error}")
+    else:
+        try:
+            member_page = yt.fetch_posts_page(member=True)
+        except YouTubeError as exc:
+            problems.append(f"Cookie 付きの投稿タブを取得できません: {exc}")
+        else:
+            label = {"member": "メンバー", "not_member": "メンバーではない", "unknown": "判定できず"}
+            comparable = comparable_public_page(public_page, member_page)
+            problem = member_page_problem(member_page, comparable) if member_page.logged_in else None
+            badge, by_comparison = (classify_member_posts(member_page, comparable)
+                                    if member_page.logged_in and not problem else ([], []))
+            ok = member_page.logged_in and member_page.membership != "not_member" and not problem
+            print(f"{'✅' if ok else '❌'} Cookie: ログイン状態={member_page.logged_in}"
+                  f" / 加入状態={label.get(member_page.membership, member_page.membership)}"
+                  f" / メン限投稿 {len(badge) + len(by_comparison)} 件（内容は表示しません）")
+            if not member_page.logged_in:
+                problems.append("Cookie でログイン状態になりません（失効の可能性）")
+            elif member_page.membership == "not_member":
+                problems.append("Cookie のアカウントがチャンネルのメンバーではありません")
+            elif problem:
+                problems.append(f"Cookie 付きの投稿タブが想定外の形です（{problem}）")
 
     for problem in problems:
         print(f"❌ {problem}")
