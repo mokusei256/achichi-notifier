@@ -8,6 +8,7 @@ import os
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 
+from . import destinations as dests
 from . import render
 from .config import Config, ConfigError
 from .discord_api import DiscordClient, DiscordError
@@ -67,12 +68,6 @@ def make_store(cfg: Config, discord: DiscordClient | None):
             raise ValueError("discord state backend needs a Discord client and DISCORD_STATE_CHANNEL_ID")
         return DiscordStateStore(discord, cfg.state_channel_id)
     return FileStateStore(cfg.state_file)
-
-
-def _mention(cfg: Config, kind: str) -> str | None:
-    if kind == "member_post":
-        return cfg.mentions.get("member_post") or cfg.mentions.get("post")
-    return cfg.mentions.get(render.GROUPS[kind])
 
 
 def comparable_public_page(public_page: PostsPage | None,
@@ -187,7 +182,7 @@ class Notifier:
                 item_type="video",
                 item_id=ref.video_id,
                 sort_key=info.published or self.now,
-                payload=render.video_payload(info, result.meta, _mention(self.cfg, info.kind)),
+                payload=render.video_payload(info, result.meta, None),  # mentions are per destination
             ))
 
     # ------------------------------------------------------------------ posts
@@ -204,7 +199,7 @@ class Notifier:
         result.queue(Notification(
             kind=kind, item_type="post", item_id=post.post_id,
             sort_key=self._post_sort_key(post, index),
-            payload=render.post_payload(post, result.meta, _mention(self.cfg, kind)),
+            payload=render.post_payload(post, result.meta, None),  # mentions are per destination
         ))
 
     def _process_public(self, state: State, result: CollectResult, page: PostsPage,
@@ -462,6 +457,29 @@ def _primary_down_alert(cfg: Config, discord: DiscordClient | None, state: State
         log.warning("could not send the primary-down alert: %s", exc)
 
 
+DESTINATION_ALERT_INTERVAL = timedelta(hours=12)
+
+
+def _destination_alert(cfg: Config, discord: DiscordClient | None, state: State,
+                       failures: dict[str, str]) -> None:
+    """Some destination could not be posted to (bot removed, missing permission, deleted channel)."""
+    if discord is None or cfg.state_backend != "discord" or not cfg.state_channel_id:
+        return
+    now = datetime.now(timezone.utc)
+    for name, detail in failures.items():
+        key = f"destination:{name}"
+        if _fresh(state.alerts.get(key), now, DESTINATION_ALERT_INTERVAL.total_seconds() / 60):
+            continue
+        message = (f"⚠️ **送り先「{name}」に通知を送れませんでした**\n`{detail[:300]}`\n"
+                   "Bot がそのサーバーにいるか、チャンネルの権限（見る・送信・埋め込みリンク・履歴を読む）を確認してください。"
+                   "\n確認: `uv run python -m achichi_notifier dest check " + name + "`")
+        try:
+            discord.send(cfg.state_channel_id, {"content": message, "allowed_mentions": {"parse": []}})
+            state.alerts[key] = now_iso()
+        except DiscordError as exc:
+            log.warning("could not send the destination alert: %s", exc)
+
+
 class _RecentlyPosted:
     """Last-line guard against duplicates (e.g. two runners racing on the shared state):
     skip a notification whose link already appears in the channel's latest messages."""
@@ -522,32 +540,44 @@ def run(cfg: Config, role: str = "primary", dry_run: bool = False) -> int:
         _cookie_alert(cfg, discord, state, role, result.member_status, result.member_detail,
                       dry_run, streak=int(runner.get("member_fail_streak") or 0))
 
+    targets_all = dests.resolve(cfg, state)
     recent = _RecentlyPosted(discord) if discord is not None and not dry_run else None
-    send_failures = skipped = 0
+    send_failures = skipped = delivered_total = 0
+    failed_destinations: dict[str, str] = {}
     for note in result.notifications:
-        channel = cfg.channel_ids.get(note.group)
-        if dry_run:
-            print(f"--- [dry-run] {note.kind} -> channel {channel or '(unset)'}")
-            print(json.dumps(note.payload, ensure_ascii=False, indent=2))
-        elif recent is not None and recent.contains(channel, note.url):
-            skipped += 1
-            log.info("this bot already posted that %s notification; not sending it again", note.kind)
-            target = state.videos if note.item_type == "video" else state.posts
-            target[note.item_id] = now_iso()
-            state.pending.pop(note.item_id, None)
+        targets = [(d, d.channel_for(note.kind)) for d in targets_all if d.wants(note.kind)]
+        targets = [(d, ch) for d, ch in targets if ch]
+        sent_or_present = failed = 0
+        for dest, channel in targets:
+            payload = render.apply_mention(note.payload, dest.mention_for(note.kind))
+            if dry_run:
+                print(f"--- [dry-run] {note.kind} -> {dest.name} channel {channel}")
+                print(json.dumps(payload, ensure_ascii=False, indent=2))
+                sent_or_present += 1
+            elif recent is not None and recent.contains(channel, note.url):
+                skipped += 1
+                sent_or_present += 1
+                log.info("this bot already posted that %s notification to %s", note.kind, dest.name)
+            else:
+                try:
+                    discord.send(channel, payload)
+                    sent_or_present += 1
+                    delivered_total += 1
+                except DiscordError as exc:
+                    failed += 1
+                    failed_destinations[dest.name] = f"{channel}: {exc}"
+                    log.error("failed to send a %s notification to %s: %s", note.kind, dest.name, exc)
+        if targets and not sent_or_present:
+            send_failures += 1  # nowhere delivered: keep it unseen and retry next run
             continue
-        else:
-            try:
-                discord.send(channel, note.payload)
-            except DiscordError as exc:
-                send_failures += 1
-                log.error("failed to send a %s notification: %s", note.kind, exc)
-                continue
         target = state.videos if note.item_type == "video" else state.posts
         target[note.item_id] = now_iso()
         state.pending.pop(note.item_id, None)
         if note.kind != "member_post":
-            log.info("%s %s %s", "would notify" if dry_run else "notified", note.kind, note.item_id)
+            log.info("%s %s %s -> %d destination(s)", "would notify" if dry_run else "notified",
+                     note.kind, note.item_id, sent_or_present)
+    if failed_destinations and not dry_run:
+        _destination_alert(cfg, discord, state, failed_destinations)
 
     runner["last_run"] = now_iso()
     runner["host"] = "github-actions" if _in_github() else "local"
@@ -562,12 +592,12 @@ def run(cfg: Config, role: str = "primary", dry_run: bool = False) -> int:
         log.info("dry-run (%s): %d notification(s) printed, nothing posted", mode, len(result.notifications))
         return 0
     store.save(state)
-    log.info("done (%s): %d notified, %d already posted, %d source error(s), %d send failure(s)", mode,
-             len(result.notifications) - send_failures - skipped, skipped, len(result.errors), send_failures)
+    log.info("done (%s): %d message(s) sent, %d already posted, %d source error(s), %d undelivered", mode,
+             delivered_total, skipped, len(result.errors), send_failures)
     return 1 if send_failures else 0
 
 
-def preview(cfg: Config, send: bool = False) -> int:
+def preview(cfg: Config, send: bool = False, dest_name: str = dests.MAIN) -> int:
     """Render the latest item of each type regardless of state (to check formatting)."""
     yt = YouTubeClient.from_config(cfg)
     notifier = Notifier(cfg, yt)
@@ -611,11 +641,18 @@ def preview(cfg: Config, send: bool = False) -> int:
     if send:
         cfg.require_discord()
         discord = DiscordClient(cfg.discord_token)
+        targets = [d for d in dests.resolve(cfg, make_store(cfg, discord).load()) if d.name == dest_name]
+        if not targets:
+            raise ConfigError(f"unknown destination: {dest_name}")
+        dest = targets[0]
         for note in notes:
-            payload = dict(note.payload)
+            channel = dest.channel_for(note.kind)
+            if not channel or not dest.wants(note.kind):
+                continue
+            payload = render.apply_mention(note.payload, None)  # previews never ping anyone
             payload["content"] = "【プレビュー】" + payload["content"]
-            discord.send(cfg.channel_ids[note.group], payload)
-            log.info("sent preview %s", note.kind)
+            discord.send(channel, payload)
+            log.info("sent preview %s to %s", note.kind, dest.name)
     else:
         for note in notes:
             print(f"--- [preview] {note.kind}")

@@ -15,7 +15,7 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 from .config import Config, ConfigError, load_dotenv
-from .discord_api import DiscordError
+from .discord_api import DiscordClient, DiscordError
 from .youtube import YouTubeError
 
 
@@ -71,6 +71,14 @@ def _check(cfg: Config) -> int:
 
     cfg.require_discord()
     problems: list[str] = []
+    from . import destinations as dests
+    from .notifier import make_store
+    try:
+        state = make_store(cfg, DiscordClient(cfg.discord_token)).load()
+        extra_destinations = [d for d in dests.resolve(cfg, state) if d.name != dests.MAIN and d.enabled]
+    except DiscordError as exc:
+        problems.append(f"共有の状態を読めません: {exc}")
+        extra_destinations = []
 
     async def gateway() -> None:
         intents = discord.Intents.none()
@@ -82,6 +90,9 @@ def _check(cfg: Config) -> int:
             try:
                 print(f"✅ [OK] Bot としてログイン: {client.user} (id={client.user.id})")
                 targets = {f"通知({k})": cid for k, cid in cfg.channel_ids.items()}
+                for dest in extra_destinations:
+                    for group, cid in sorted(dest.channels.items()):
+                        targets[f"送り先 {dest.name}({group})"] = cid
                 if cfg.state_backend == "discord":
                     targets["状態保存"] = cfg.state_channel_id
                 for label, cid in targets.items():
@@ -171,8 +182,30 @@ def main(argv: list[str] | None = None) -> int:
 
     p_prev = sub.add_parser("preview", help="render the latest item of each type")
     p_prev.add_argument("--send", action="store_true", help="actually post the previews")
+    p_prev.add_argument("--dest", default="main", help="destination to preview for (default: main)")
 
     sub.add_parser("check", help="gateway login + permission and YouTube checks")
+
+    p_dest = sub.add_parser("dest", help="manage notification destinations (other Discord servers)")
+    dsub = p_dest.add_subparsers(dest="dest_command", required=True)
+    dsub.add_parser("list", help="show all destinations")
+    d_add = dsub.add_parser("add", help="add or update a destination")
+    d_add.add_argument("name", help="short name, e.g. bigserver")
+    d_add.add_argument("--channel", required=True, help="channel id for everything")
+    for group in ("video", "short", "live", "post"):
+        d_add.add_argument(f"--{group}-channel", help=f"separate channel id for {group} notifications")
+    d_add.add_argument("--kinds", help="comma list of video,short,live,post,member_post (default: all)")
+    for key in ("video", "short", "live", "post", "member_post"):
+        d_add.add_argument(f"--mention-{key.replace('_', '-')}", dest=f"mention_{key}",
+                           help=f"mention for {key}, e.g. '<@&ROLE_ID>' or @everyone")
+    d_rm = dsub.add_parser("remove", help="delete a destination")
+    d_rm.add_argument("name")
+    for verb in ("enable", "disable"):
+        d_en = dsub.add_parser(verb, help=f"{verb} a destination")
+        d_en.add_argument("name")
+    d_chk = dsub.add_parser("check", help="check the bot can see/post to a destination's channels")
+    d_chk.add_argument("name")
+    d_chk.add_argument("--send-test", action="store_true", help="also post a short test message")
 
     args = parser.parse_args(argv)
     _safe_console()
@@ -194,7 +227,19 @@ def main(argv: list[str] | None = None) -> int:
             return run(cfg, role=args.role, dry_run=args.dry_run)
         if args.command == "preview":
             from .notifier import preview
-            return preview(cfg, send=args.send)
+            return preview(cfg, send=args.send, dest_name=args.dest)
+        if args.command == "dest":
+            from . import dest_cli
+            if args.dest_command == "list":
+                return dest_cli.cmd_list(cfg)
+            if args.dest_command == "add":
+                return dest_cli.cmd_add(cfg, args)
+            if args.dest_command == "remove":
+                return dest_cli.cmd_remove(cfg, args.name)
+            if args.dest_command in ("enable", "disable"):
+                return dest_cli.cmd_enable(cfg, args.name, args.dest_command == "enable")
+            if args.dest_command == "check":
+                return dest_cli.cmd_check(cfg, args.name, args.send_test)
         if args.command == "check":
             return _check(cfg)
     except ConfigError as exc:

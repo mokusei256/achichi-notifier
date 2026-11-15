@@ -289,6 +289,40 @@ Cookie に問題があっても、**動画・公開投稿の通知は止まり�
 
 ---
 
+## 別のサーバーにも通知する（送り先の追加）
+
+`.env` のチャンネルは「main」という送り先です。ほかのサーバーへは、**ターミナルからコマンドで送り先を追加**します。送り先の一覧は #管理 の共有状態に保存されるので、Mac で追加すれば Windows の主系も次の確認（5 分以内）から送ります。ファイルの編集や `install` のやり直しは不要です。
+
+1. そのサーバーに Bot を招待する（「1. Discord Bot を作る」と同じ招待 URL。招待には、そのサーバーの「サーバー管理」権限が必要です）。非公開チャンネルなら、Bot に「見る・送信・埋め込みリンク・メッセージ履歴を読む」を付けます。
+2. 通知を流したいチャンネルの ID をコピーする（開発者モードで右クリック → ID をコピー）
+3. Mac のターミナルで追加する（Bot がそのチャンネルを見られることを確認してから登録します）
+
+```bash
+cd ~/Documents/DiscordBot_achichi
+uv run python -m achichi_notifier dest add bigserver --channel 123456789012345678
+```
+
+よく使うオプション:
+
+| オプション | 意味 |
+|---|---|
+| `--live-channel ID` など | 種類ごとに別のチャンネルへ（`--video-channel` `--short-channel` `--live-channel` `--post-channel`） |
+| `--kinds video,live` | 送る種類を絞る（`video` `short` `live` `post` `member_post`。省略時はすべて） |
+| `--mention-live '<@&ロールID>'` | 種類ごとのメンション（`--mention-video` `--mention-short` `--mention-live` `--mention-post` `--mention-member-post`） |
+
+同じ名前でもう一度 `add` すると上書きされます。そのほかの操作:
+
+```bash
+uv run python -m achichi_notifier dest list                       # 一覧
+uv run python -m achichi_notifier dest check bigserver --send-test # 権限の確認とテスト送信
+uv run python -m achichi_notifier dest disable bigserver          # 一時停止（enable で再開）
+uv run python -m achichi_notifier dest remove bigserver           # 削除
+uv run python -m achichi_notifier preview --send --dest bigserver # 見た目の確認（【プレビュー】付き・メンションなし）
+```
+
+- 1 つの送り先に送れなくても、ほかの送り先には届きます（#管理 に「送り先「〇〇」に通知を送れませんでした」と届きます）。すべての送り先に送れなかった通知は、次の確認でもう一度送ります。
+- 大きなサーバーでメン限投稿のリンクを流したくない場合は、`--kinds` から `member_post` を外してください。
+
 ## コマンド一覧
 
 | コマンド | 内容 |
@@ -297,7 +331,8 @@ Cookie に問題があっても、**動画・公開投稿の通知は止まり�
 | `run --role fallback` | 主系が `FALLBACK_AFTER_MINUTES` 以上止まっているときは全体を確認。Cookie があれば `MEMBER_CHECK_MINUTES` ごとにメン限投稿を確認（Mac 用） |
 | `run --dry-run --state-file /tmp/achichi-test-state.json` | 投稿せずに表示するだけ。状態はリポジトリの外の一時ファイルに保存し、Discord の状態には触れない |
 | `preview [--send]` | 種類ごとの最新 1 件を通知の見た目で表示／送信 |
-| `check` | ゲートウェイログイン・権限・YouTube・Cookie を確認 |
+| `check` | ゲートウェイログイン・権限（追加した送り先も含む）・YouTube・Cookie を確認 |
+| `dest list/add/remove/enable/disable/check` | 通知の送り先を管理（[上記](#別のサーバーにも通知する送り先の追加)） |
 
 すべて `uv run python -m achichi_notifier <コマンド>` の形で実行します。
 

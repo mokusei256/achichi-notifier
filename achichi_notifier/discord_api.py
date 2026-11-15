@@ -63,6 +63,9 @@ class DiscordClient:
     def send(self, channel_id: str, payload: dict) -> dict:
         return self._request("POST", f"/channels/{channel_id}/messages", json=payload)
 
+    def edit_message(self, channel_id: str, message_id: str, payload: dict) -> dict:
+        return self._request("PATCH", f"/channels/{channel_id}/messages/{message_id}", json=payload)
+
     def get_message(self, channel_id: str, message_id: str) -> dict:
         return self._request("GET", f"/channels/{channel_id}/messages/{message_id}")
 

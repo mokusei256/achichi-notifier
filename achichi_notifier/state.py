@@ -19,12 +19,13 @@ from .discord_api import DiscordClient, DiscordError
 
 log = logging.getLogger(__name__)
 
-STATE_VERSION = 2
+STATE_VERSION = 3
 STATE_FILENAME = "achichi-notifier-state.json"
 MAX_ENTRIES = 1500
 PENDING_TTL_HOURS = 72
 BACKLOG_PREFIX = "backlog@"  # pending entries recorded at the members-only comparison baseline
-KNOWN_KEYS = {"version", "videos", "posts", "seeded", "runners", "alerts", "pending"}
+KNOWN_KEYS = {"version", "videos", "posts", "seeded", "runners", "alerts", "pending",
+              "destinations", "destinations_updated"}
 
 
 def now_iso() -> str:
@@ -57,6 +58,10 @@ class State:
     # Posts that looked members-only only by comparison (no badge); announced after a
     # second confirming observation. post_id -> first seen.
     pending: dict[str, str] = field(default_factory=dict)
+    # Extra notification destinations managed with `achichi_notifier dest ...` (name -> dict),
+    # and when that list was last changed (the newer list wins on merge).
+    destinations: dict[str, dict] = field(default_factory=dict)
+    destinations_updated: str | None = None
     # Unknown top-level keys written by a newer version are carried through untouched,
     # so an older copy of the bot (e.g. on the Mac) never erases them.
     extra: dict = field(default_factory=dict)
@@ -74,6 +79,8 @@ class State:
             runners={k: dict(v) for k, v in (data.get("runners") or {}).items()},
             alerts=dict(data.get("alerts") or {}),
             pending=dict(data.get("pending") or {}),
+            destinations={k: dict(v) for k, v in (data.get("destinations") or {}).items()},
+            destinations_updated=data.get("destinations_updated"),
             extra={k: v for k, v in data.items() if k not in KNOWN_KEYS},
         )
 
@@ -87,6 +94,8 @@ class State:
             "runners": self.runners,
             "alerts": self.alerts,
             "pending": self.pending,
+            "destinations": self.destinations,
+            "destinations_updated": self.destinations_updated,
         }
 
     def merge_from(self, other: State) -> None:
@@ -110,6 +119,9 @@ class State:
         for key, value in other.alerts.items():
             self.alerts[key] = _max_iso(self.alerts.get(key), value)
         self.extra.update(other.extra)  # this version never edits extra; newest copy wins
+        if _max_iso(self.destinations_updated, other.destinations_updated) != self.destinations_updated:
+            self.destinations = {k: dict(v) for k, v in other.destinations.items()}
+            self.destinations_updated = other.destinations_updated
         # A pending post that either side has since announced or seen publicly is settled.
         for key in [k for k in self.pending if k in self.posts]:
             del self.pending[key]

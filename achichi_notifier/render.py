@@ -136,3 +136,12 @@ def post_payload(post: Post, meta: ChannelMeta | None, mention: str | None) -> d
         "embeds": [embed],
         "allowed_mentions": _allowed_mentions(mention),
     }
+
+
+def apply_mention(payload: dict, mention: str | None) -> dict:
+    """Copy of a payload rendered without a mention, with this destination's mention added."""
+    result = dict(payload)
+    if mention:
+        result["content"] = f"{mention} {payload['content']}"
+    result["allowed_mentions"] = _allowed_mentions(mention)
+    return result
