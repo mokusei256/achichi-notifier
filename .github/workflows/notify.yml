@@ -1,0 +1,74 @@
+name: notify
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"   # check (GitHub may delay scheduled runs by several minutes)
+    - cron: "23 3 * * 1"    # weekly keepalive check (see keepalive job)
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: achichi-notifier
+  cancel-in-progress: false
+
+jobs:
+  notify:
+    if: github.event.schedule != '23 3 * * 1'
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Install
+        run: uv sync --frozen --no-dev
+
+      - name: Check YouTube and post to Discord
+        env:
+          DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
+          YOUTUBE_COOKIES_B64: ${{ secrets.YOUTUBE_COOKIES_B64 }}
+          DISCORD_CHANNEL_ID: ${{ vars.DISCORD_CHANNEL_ID }}
+          DISCORD_STATE_CHANNEL_ID: ${{ vars.DISCORD_STATE_CHANNEL_ID }}
+          DISCORD_CHANNEL_ID_VIDEO: ${{ vars.DISCORD_CHANNEL_ID_VIDEO }}
+          DISCORD_CHANNEL_ID_SHORT: ${{ vars.DISCORD_CHANNEL_ID_SHORT }}
+          DISCORD_CHANNEL_ID_LIVE: ${{ vars.DISCORD_CHANNEL_ID_LIVE }}
+          DISCORD_CHANNEL_ID_POST: ${{ vars.DISCORD_CHANNEL_ID_POST }}
+          MENTION_VIDEO: ${{ vars.MENTION_VIDEO }}
+          MENTION_SHORT: ${{ vars.MENTION_SHORT }}
+          MENTION_LIVE: ${{ vars.MENTION_LIVE }}
+          MENTION_POST: ${{ vars.MENTION_POST }}
+          MENTION_MEMBER_POST: ${{ vars.MENTION_MEMBER_POST }}
+          MAX_AGE_HOURS: ${{ vars.MAX_AGE_HOURS }}
+        run: |
+          if [ -z "$DISCORD_BOT_TOKEN" ]; then
+            echo "::notice::DISCORD_BOT_TOKEN secret is not set; skipping"
+            exit 0
+          fi
+          uv run --frozen --no-dev python -m achichi_notifier --env-file /dev/null run --role primary
+
+  # Public repos: GitHub disables scheduled workflows after 60 days without repository
+  # activity. Push an empty commit when the last commit is older than 45 days.
+  keepalive:
+    if: github.event.schedule == '23 3 * * 1'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Empty commit if the repository has been quiet for 45 days
+        run: |
+          last=$(git log -1 --format=%ct)
+          now=$(date +%s)
+          age_days=$(( (now - last) / 86400 ))
+          echo "last commit ${age_days} days ago"
+          if [ "$age_days" -ge 45 ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git commit --allow-empty -m "chore: keepalive (scheduled workflows stay enabled)"
+            git push
+          fi
