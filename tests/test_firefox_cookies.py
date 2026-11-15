@@ -231,3 +231,14 @@ def test_stale_snapshot_dirs_are_removed(tmp_path):
     fc.read_youtube_cookies(prof, now=NOW, tmp_parent=scratch)
     conn.close()
     assert sorted(p.name for p in scratch.iterdir()) == ["ffck-new"]
+
+
+def test_wal_generation_change_forces_a_new_snapshot(tmp_path, monkeypatch):
+    prof, conn = make_profile(tmp_path, auth_rows(), wal_only_rows=auth_rows("^userContextId=1"))
+    generations = iter([b"A" * 12, b"B" * 12] * 10)  # WAL restarted between every pair of reads
+    monkeypatch.setattr(fc, "_wal_generation", lambda path: next(generations))
+    monkeypatch.setattr(fc.time, "sleep", lambda s: None)
+    with pytest.raises(fc.FirefoxCookieError) as err:
+        fc.read_youtube_cookies(prof, now=NOW)
+    conn.close()
+    assert "kept changing" in str(err.value) and err.value.transient

@@ -126,7 +126,7 @@ uv run python -m achichi_notifier preview --send
    & "$env:LOCALAPPDATA\achichi-notifier\venv\Scripts\python.exe" -m achichi_notifier --env-file "$env:LOCALAPPDATA\achichi-notifier\.env" check
    ```
 
-   > **メン限投稿用の Cookie は「Bot 用 Firefox」がおすすめ**: `install.ps1 -FirefoxProfile` で設定します（[6.](#6-メン限投稿用の-cookie自宅の-pc-にだけ置く) の「おすすめ」）。毎日の再起動などで**サインインしていなくても動かしたい**場合は、管理者として開いた PowerShell で `-RunWithoutSignIn` を付けて実行します（パスワードは保存しない方式です）。
+   > **メン限投稿用の Cookie は「Bot 用 Firefox」がおすすめ**: `install.ps1 -FirefoxProfile` で設定します（[6.](#6-メン限投稿用の-cookie自宅の-pc-にだけ置く) の「おすすめ」）。毎日の再起動などで**サインインしていなくても動かしたい**場合は、普段使っている自分のアカウントのまま「管理者として実行」した PowerShell で `-RunWithoutSignIn` を付けて実行します（パスワードは保存しない方式です。一度設定すると、次からはスイッチなしで再実行しても引き継がれます。元に戻すときは `-SignInOnly`）。別の管理者アカウントでサインインして実行すると、そのアカウント用に入ってしまうので注意してください。
 
 7. **スリープしない設定にする**: 設定 → システム → 電源 → 「電源接続時に、次の時間が経過した後にデバイスをスリープ状態にする」を「なし」。スリープ中は動きません。
 
@@ -335,6 +335,8 @@ Cookie に問題があっても、**動画・公開投稿の通知は止まり�
 ---
 
 ## 別のサーバーにも通知する（送り先の追加）
+
+> **先に Windows と Mac の両方を最新版にしてください**（Windows: `git pull` → `install.ps1`、Mac: `./deploy/mac/install.sh`）。古い版の PC は追加の送り先を知らないので、その PC が通知した分は main にしか届きません（`dest list` / `dest add` で古い版が動いていれば警告が出ます）。
 
 `.env` のチャンネルは「main」という送り先です。ほかのサーバーへは、**ターミナルからコマンドで送り先を追加**します。送り先の一覧は #管理 の共有状態に保存されるので、Mac で追加すれば Windows の主系も次の確認（5 分以内）から送ります。ファイルの編集や `install` のやり直しは不要です。
 

@@ -28,6 +28,8 @@ DEFAULT_DWELL = 150
 GOOD = ("ok", "skipped-in-use")
 NOT_COUNTED = ("not-set-up",)
 ROTATING = ("__Secure-1PSIDTS", "__Secure-3PSIDTS")
+IN_USE_DAYS_LIMIT = 3  # "in use" this many times in a row is treated as a stuck profile
+SECRET_ENV_PREFIXES = ("DISCORD_", "YOUTUBE_COOKIES", "MENTION_")
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 
@@ -87,6 +89,30 @@ def find_firefox(explicit: str | None = None) -> Path | None:
     return None
 
 
+def _browser_env() -> dict:
+    """Environment for Firefox without the bot's secrets (loaded from .env into os.environ)."""
+    env = {k: v for k, v in os.environ.items() if not k.upper().startswith(SECRET_ENV_PREFIXES)}
+    env.update(MOZ_DISABLE_UPDATE_PROCESSING="1", MOZ_CRASHREPORTER_NO_REPORT="1")
+    return env
+
+
+def kill_leftover_headless(profile: Path) -> int:
+    """Stop headless Firefox processes left over on the bot profile (never touches windows the
+    user opened: only processes started with --headless for this profile)."""
+    if sys.platform != "win32":
+        return 0
+    path = str(Path(profile)).replace("'", "''")
+    script = ("$n = 0; Get-CimInstance Win32_Process -Filter \"Name='firefox.exe'\" | "
+              f"Where-Object {{ $_.CommandLine -like '*--headless*' -and $_.CommandLine -like '*{path}*' }} | "
+              "ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue; $n++ }; $n")
+    try:
+        out = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+                             capture_output=True, text=True, creationflags=NO_WINDOW, timeout=60)
+        return int((out.stdout or "0").strip().splitlines()[-1] or 0)
+    except (OSError, ValueError, subprocess.TimeoutExpired, IndexError):
+        return 0
+
+
 def _taskkill(proc: subprocess.Popen) -> None:
     if sys.platform == "win32":
         # /T: the launcher (our PID) waits for the browser under --headless, so the whole
@@ -99,7 +125,7 @@ def _taskkill(proc: subprocess.Popen) -> None:
 
 def refresh(profile: Path, firefox: Path | None, dwell: float = DEFAULT_DWELL,
             url: str = DEFAULT_URL, popen=subprocess.Popen, kill=_taskkill,
-            in_use=fc.profile_in_use, sleep=time.sleep) -> str:
+            in_use=fc.profile_in_use, sleep=time.sleep, cleanup=kill_leftover_headless) -> str:
     profile = Path(profile)
     status = read_status(profile)
     status["last_attempt"] = _now()
@@ -107,6 +133,12 @@ def refresh(profile: Path, firefox: Path | None, dwell: float = DEFAULT_DWELL,
     def finish(result: str, **extra) -> str:
         status.update(extra, last_result=result)
         status.pop("running_since", None)
+        if result == "skipped-in-use":
+            status["in_use_streak"] = int(status.get("in_use_streak") or 0) + 1
+            if status["in_use_streak"] >= IN_USE_DAYS_LIMIT:
+                result = "stuck-in-use"  # a window open at refresh time for days: likely stuck
+        else:
+            status["in_use_streak"] = 0
         if result in GOOD:
             status["consecutive_failures"] = 0
             status["last_ok"] = status["last_attempt"]
@@ -121,12 +153,14 @@ def refresh(profile: Path, firefox: Path | None, dwell: float = DEFAULT_DWELL,
         return finish("not-set-up")
     if firefox is None or not Path(firefox).is_file():
         return finish("firefox-missing")
+    if in_use(profile) and cleanup(profile):
+        sleep(3)  # a headless Firefox from an earlier run was still holding the profile
     if in_use(profile):
         return finish("skipped-in-use")  # a visible window already keeps the session fresh
     before = _digests(profile)
     status["running_since"] = _now()
     _write_status(profile, status)
-    env = dict(os.environ, MOZ_DISABLE_UPDATE_PROCESSING="1", MOZ_CRASHREPORTER_NO_REPORT="1")
+    env = _browser_env()
     try:
         proc = popen([str(firefox), "--headless", "--profile", str(profile), url], env=env,
                      stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,

@@ -56,8 +56,12 @@ param(
     [string]$BrowserTaskName = "achichi-notifier-browser",
 
     # Run the tasks even when nobody is signed in (e.g. after a scheduled restart). Uses the
-    # S4U logon type, which stores no password. Needs an administrator PowerShell.
-    [switch]$RunWithoutSignIn
+    # S4U logon type, which stores no password. Needs an administrator PowerShell. Once set,
+    # later runs keep it (use -SignInOnly to go back).
+    [switch]$RunWithoutSignIn,
+
+    # Go back to running the tasks only while you are signed in.
+    [switch]$SignInOnly
 )
 
 $ErrorActionPreference = "Stop"
@@ -150,10 +154,17 @@ if ($UseFirefox) {
     $FirefoxPath = Find-Firefox $FirefoxExe
     if (-not $FirefoxPath) { Fail "Firefox was not found. Install Firefox (or pass -FirefoxExe <path>) and run this script again." }
 }
-if ($RunWithoutSignIn) {
+if ($RunWithoutSignIn -and $SignInOnly) { Fail "Use either -RunWithoutSignIn or -SignInOnly, not both." }
+# Keep the earlier choice: re-running the script (README, #kanri alerts) must not silently
+# switch a "run without sign-in" task back to "only while signed in".
+$existing = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+$UseS4U = $RunWithoutSignIn -or ($existing -and "$($existing.Principal.LogonType)" -eq "S4U" -and -not $SignInOnly)
+if ($UseS4U) {
     $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
         [Security.Principal.WindowsBuiltInRole]::Administrator)
-    if (-not $isAdmin) { Fail "-RunWithoutSignIn needs an administrator PowerShell (Run as administrator)." }
+    if (-not $isAdmin) {
+        Fail "The tasks run without sign-in (S4U), which needs an administrator PowerShell: right-click PowerShell > Run as administrator, then run this again (or add -SignInOnly to switch back)."
+    }
 }
 
 $CookieSource = $null
@@ -284,7 +295,7 @@ if (-not (Test-Path -LiteralPath $PythonW)) {
     Write-Host "WARNING: pythonw.exe not found; using python.exe (a console window may flash)." -ForegroundColor Yellow
     $Exe = $Python
 }
-if ($RunWithoutSignIn) {
+if ($UseS4U) {
     $Principal = New-ScheduledTaskPrincipal -UserId $Account -LogonType S4U -RunLevel Limited
 } else {
     $Principal = New-ScheduledTaskPrincipal -UserId $Account -LogonType Interactive -RunLevel Limited

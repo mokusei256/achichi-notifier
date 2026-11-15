@@ -21,6 +21,7 @@ from .youtube import (
 log = logging.getLogger(__name__)
 
 ROLES = ("primary", "fallback")
+FEATURES = ("destinations",)
 COOKIE_ALERT_INTERVAL = timedelta(hours=24)
 # Consecutive failed members-only checks before the state channel is told (~30 min on the
 # Windows primary, ~1h on the Mac). Covers temporary page problems and Firefox-profile reads
@@ -509,18 +510,23 @@ DESTINATION_ALERT_INTERVAL = timedelta(hours=12)
 
 
 def _destination_alert(cfg: Config, discord: DiscordClient | None, state: State,
-                       failures: dict[str, str]) -> None:
-    """Some destination could not be posted to (bot removed, missing permission, deleted channel)."""
+                       failures: dict[str, tuple[str, str, bool]]) -> None:
+    """Some destination could not be posted to (bot removed, missing permission, deleted
+    channel, or temporary trouble that will be retried)."""
     if discord is None or cfg.state_backend != "discord" or not cfg.state_channel_id:
         return
     now = datetime.now(timezone.utc)
-    for name, detail in failures.items():
+    for name, (detail, url, transient) in failures.items():
         key = f"destination:{name}"
         if _fresh(state.alerts.get(key), now, DESTINATION_ALERT_INTERVAL.total_seconds() / 60):
             continue
+        if transient:
+            cause = "一時的なエラーのようです。次の確認で自動的にもう一度送ります。"
+        else:
+            cause = ("Bot がそのサーバーにいるか、チャンネルの権限（見る・送信・埋め込みリンク・履歴を読む）を確認してください。"
+                     "\n確認: `uv run python -m achichi_notifier dest check " + name + "`")
         message = (f"⚠️ **送り先「{name}」に通知を送れませんでした**\n`{detail[:300]}`\n"
-                   "Bot がそのサーバーにいるか、チャンネルの権限（見る・送信・埋め込みリンク・履歴を読む）を確認してください。"
-                   "\n確認: `uv run python -m achichi_notifier dest check " + name + "`")
+                   + (f"対象: <{url}>\n" if url else "") + cause)
         try:
             discord.send(cfg.state_channel_id, {"content": message, "allowed_mentions": {"parse": []}})
             state.alerts[key] = now_iso()
@@ -546,6 +552,10 @@ class _RecentlyPosted:
                 log.warning("could not read recent messages for the duplicate check: %s", exc)
                 self.cache[channel_id] = set()
         return url in self.cache[channel_id]
+
+    def add(self, channel_id: str, url: str | None) -> None:
+        if url and channel_id in self.cache:
+            self.cache[channel_id].add(url)
 
 
 def run(cfg: Config, role: str = "primary", dry_run: bool = False) -> int:
@@ -594,12 +604,17 @@ def run(cfg: Config, role: str = "primary", dry_run: bool = False) -> int:
     targets_all = dests.resolve(cfg, state)
     recent = _RecentlyPosted(discord) if discord is not None and not dry_run else None
     send_failures = skipped = delivered_total = 0
-    failed_destinations: dict[str, str] = {}
+    failed_destinations: dict[str, tuple[str, str, bool]] = {}
     for note in result.notifications:
         targets = [(d, d.channel_for(note.kind)) for d in targets_all if d.wants(note.kind)]
         targets = [(d, ch) for d, ch in targets if ch]
-        sent_or_present = failed = 0
+        sent_or_present = 0
+        retry_later = False
+        handled_channels: set[str] = set()
         for dest, channel in targets:
+            if channel in handled_channels:  # two destinations pointing at one channel
+                continue
+            handled_channels.add(channel)
             payload = render.apply_mention(note.payload, dest.mention_for(note.kind))
             if dry_run:
                 print(f"--- [dry-run] {note.kind} -> {dest.name} channel {channel}")
@@ -614,12 +629,16 @@ def run(cfg: Config, role: str = "primary", dry_run: bool = False) -> int:
                     discord.send(channel, payload)
                     sent_or_present += 1
                     delivered_total += 1
+                    if recent is not None:
+                        recent.add(channel, note.url)
                 except DiscordError as exc:
-                    failed += 1
-                    failed_destinations[dest.name] = f"{channel}: {exc}"
+                    # Temporary trouble: keep the item unseen so the next run retries; channels
+                    # that already got it are skipped then by the recent-links guard.
+                    retry_later = retry_later or exc.transient
+                    failed_destinations[dest.name] = (f"{channel}: {exc}", note.url or "", exc.transient)
                     log.error("failed to send a %s notification to %s: %s", note.kind, dest.name, exc)
-        if targets and not sent_or_present:
-            send_failures += 1  # nowhere delivered: keep it unseen and retry next run
+        if targets and (not sent_or_present or retry_later):
+            send_failures += 1
             continue
         target = state.videos if note.item_type == "video" else state.posts
         target[note.item_id] = now_iso()
@@ -632,6 +651,7 @@ def run(cfg: Config, role: str = "primary", dry_run: bool = False) -> int:
 
     runner["last_run"] = now_iso()
     runner["host"] = "github-actions" if _in_github() else "local"
+    runner["features"] = list(FEATURES)  # lets `dest` warn about runners still on an old version
     if mode == "full" and not result.errors and not send_failures:
         runner["last_success"] = now_iso()
 
@@ -692,7 +712,7 @@ def preview(cfg: Config, send: bool = False, dest_name: str = dests.MAIN) -> int
     if send:
         cfg.require_discord()
         discord = DiscordClient(cfg.discord_token)
-        targets = [d for d in dests.resolve(cfg, make_store(cfg, discord).load()) if d.name == dest_name]
+        targets = [d for d in dests.resolve(cfg, make_store(cfg, discord).load()) if d.name == dest_name.lower()]
         if not targets:
             raise ConfigError(f"unknown destination: {dest_name}")
         dest = targets[0]

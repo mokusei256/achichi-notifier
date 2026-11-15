@@ -90,3 +90,25 @@ def test_missing_firefox_and_not_set_up(tmp_path):
     (prof / "cookies.sqlite").unlink()
     assert br.refresh(prof, Path(sys.executable)) == "not-set-up"
     assert br.read_status(prof)["consecutive_failures"] == 1  # not counted
+
+
+def test_firefox_never_gets_the_bots_secrets(monkeypatch):
+    monkeypatch.setenv("DISCORD_BOT_TOKEN", "secret-token")
+    monkeypatch.setenv("YOUTUBE_COOKIES_B64", "secret-cookies")
+    monkeypatch.setenv("MENTION_LIVE", "<@&1>")
+    monkeypatch.setenv("PATH", "/usr/bin")
+    env = br._browser_env()
+    assert "DISCORD_BOT_TOKEN" not in env and "YOUTUBE_COOKIES_B64" not in env and "MENTION_LIVE" not in env
+    assert env["PATH"] == "/usr/bin" and env["MOZ_DISABLE_UPDATE_PROCESSING"] == "1"
+
+
+def test_profile_in_use_for_days_counts_as_a_failure(tmp_path):
+    prof = tmp_path / "profile"
+    prof.mkdir()
+    (prof / fc.MARKER).write_text("bot profile")
+    (prof / fc.DB_NAME).write_bytes(b"")
+    results = [br.refresh(prof, Path(sys.executable), in_use=lambda p: True, cleanup=lambda p: 0,
+                          sleep=lambda s: None) for _ in range(br.IN_USE_DAYS_LIMIT)]
+    assert results[:-1] == ["skipped-in-use"] * (br.IN_USE_DAYS_LIMIT - 1)
+    assert results[-1] == "stuck-in-use"
+    assert br.read_status(prof)["consecutive_failures"] == 1

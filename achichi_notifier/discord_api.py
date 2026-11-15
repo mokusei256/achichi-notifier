@@ -17,7 +17,14 @@ API = "https://discord.com/api/v10"
 
 
 class DiscordError(Exception):
-    pass
+    def __init__(self, message: str, status: int | None = None):
+        super().__init__(message)
+        self.status = status  # HTTP status, None for network problems
+
+    @property
+    def transient(self) -> bool:
+        """Worth retrying later (network trouble, rate limit, Discord-side errors)."""
+        return self.status is None or self.status == 429 or self.status >= 500
 
 
 class DiscordClient:
@@ -51,9 +58,10 @@ class DiscordClient:
                 time.sleep(2)
                 continue
             if not resp.ok:
-                raise DiscordError(f"{method} {path} -> HTTP {resp.status_code}: {resp.text[:300]}")
+                raise DiscordError(f"{method} {path} -> HTTP {resp.status_code}: {resp.text[:300]}",
+                                   status=resp.status_code)
             return resp.json() if resp.content else None
-        raise DiscordError(f"{method} {path}: too many retries")
+        raise DiscordError(f"{method} {path}: too many retries", status=429)
 
     def me(self) -> dict:
         if self._me is None:
