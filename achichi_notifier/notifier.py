@@ -22,8 +22,12 @@ log = logging.getLogger(__name__)
 
 ROLES = ("primary", "fallback")
 COOKIE_ALERT_INTERVAL = timedelta(hours=24)
-# Consecutive failed members-only checks before the state channel is told (~1h on the Mac).
+# Consecutive failed members-only checks before the state channel is told (~30 min on the
+# Windows primary, ~1h on the Mac). Covers temporary page problems and Firefox-profile reads
+# that fail while someone is logging in again.
 FETCH_FAIL_ALERT_STREAK = 6
+STREAK_STATUSES = ("fetch_failed", "read_failed")
+BROWSER_REFRESH_ALERT_FAILURES = 3
 
 
 @dataclass
@@ -51,8 +55,9 @@ class CollectResult:
     meta: ChannelMeta | None = None
     # Members-only check outcome. Cookie problems never count as errors: they must not
     # stop video/public-post notifications or make the fallback take over everything.
-    member_status: str | None = None  # None | ok | unreadable | logged_out | not_member | fetch_failed
+    member_status: str | None = None  # None | ok | unreadable | read_failed | logged_out | not_member | fetch_failed
     member_detail: str | None = None
+    cookie_source: str | None = None  # firefox | file | env
     queued: set = field(default_factory=set)
 
     def queue(self, note: Notification) -> None:
@@ -279,8 +284,10 @@ class Notifier:
     def _fetch_member_page(self, result: CollectResult) -> PostsPage | None:
         if not self.yt.cookies_configured:
             return None
+        result.cookie_source = getattr(self.yt, "cookie_source", None)
         if self.yt.cookie_error or not self.yt.has_cookies:
-            result.member_status, result.member_detail = "unreadable", self.yt.cookie_error
+            status = "read_failed" if getattr(self.yt, "cookie_transient", False) else "unreadable"
+            result.member_status, result.member_detail = status, self.yt.cookie_error
             return None
         try:
             page = self.yt.fetch_posts_page(member=True)
@@ -384,15 +391,30 @@ COOKIE_PROBLEMS = {
                   "（メンバーシップが切れた可能性があります）。",
     "fetch_failed": "メン限投稿のチェックが {streak} 回続けて失敗しています（{detail}）。"
                     "YouTube の一時的な不調か、ページの形が変わった可能性があります。",
+    "read_failed": "Bot 用 Firefox プロファイルから YouTube のログイン Cookie を {streak} 回続けて取得できません（{detail}）。",
 }
 
+FIREFOX_LOGIN_FIX = ("主系の PC でスタートメニューの「achichi-notifier YouTube login」を開き、通常ウィンドウのまま"
+                     "メンバー加入済みのアカウントで YouTube にログインしてください。パスワードは保存せず、"
+                     "ログアウトせずにメニューから Firefox を終了します。次の確認（5 分以内）で自動的に戻ります。"
+                     "何も表示されないときは 3 分待ってもう一度（毎日の自動更新中の可能性）。")
 
-def _cookie_fix(role: str, status: str) -> str:
+
+def _cookie_fix(role: str, status: str, source: str | None = None) -> str:
     if status == "fetch_failed":
         return ("しばらく様子を見て、続くようなら、この PC にインストールしたアプリで check を実行してください"
                 "（Windows: `& \"$env:LOCALAPPDATA\\achichi-notifier\\venv\\Scripts\\python.exe\" -m achichi_notifier "
                 "--env-file \"$env:LOCALAPPDATA\\achichi-notifier\\.env\" check`、Mac: "
                 "`cd ~/Library/Application\\ Support/achichi-notifier && ./venv/bin/python -m achichi_notifier check`）。")
+    if source == "firefox":
+        if status == "unreadable":
+            return ("主系の PC で `git pull` → `deploy\\windows\\install.ps1 -FirefoxProfile` を実行してください。"
+                    "Firefox の更新で保存形式が変わった可能性があるときは、アプリの更新が必要です。"
+                    "急ぐ場合は、従来どおり cookies.txt を書き出して置き、`install.ps1 -NoFirefoxProfile` で切り替えられます。")
+        if status == "not_member":
+            return ("ログイン用ショートカット「achichi-notifier YouTube login」で開き、右上のアカウントを確認して、"
+                    "メンバー加入済みのアカウントでログインし直してください。")
+        return FIREFOX_LOGIN_FIX
     if _in_github():
         return ("Cookie はクラウドに置かない運用です。GitHub の Secret `YOUTUBE_COOKIES_B64` を "
                 "`gh secret delete YOUTUBE_COOKIES_B64` で削除してください。")
@@ -404,13 +426,14 @@ def _cookie_fix(role: str, status: str) -> str:
 
 
 def _cookie_alert(cfg: Config, discord: DiscordClient | None, state: State, role: str,
-                  status: str, detail: str | None, dry_run: bool, streak: int = 0) -> None:
+                  status: str, detail: str | None, dry_run: bool, streak: int = 0,
+                  source: str | None = None) -> None:
     if status not in COOKIE_PROBLEMS:
         return
     # Keep public Actions logs generic; the details go to the private state channel only.
     shown = "see the state channel" if _in_github() else f"{status} ({detail})" if detail else status
     log.warning("members-only check degraded: %s", shown)
-    if status == "fetch_failed" and streak < FETCH_FAIL_ALERT_STREAK:
+    if status in STREAK_STATUSES and streak < FETCH_FAIL_ALERT_STREAK:
         return
     if dry_run or discord is None or cfg.state_backend != "discord" or not cfg.state_channel_id:
         return
@@ -419,7 +442,7 @@ def _cookie_alert(cfg: Config, discord: DiscordClient | None, state: State, role
         return
     message = (f"⚠️ **メン限投稿のチェックが止まっています**（{_runner_label(role)}）\n"
                + COOKIE_PROBLEMS[status].format(detail=detail or "詳細不明", streak=streak)
-               + "\n動画・公開投稿の通知はこのまま続きます。\n対処: " + _cookie_fix(role, status))
+               + "\n動画・公開投稿の通知はこのまま続きます。\n対処: " + _cookie_fix(role, status, source))
     try:
         discord.send(cfg.state_channel_id, {"content": message, "allowed_mentions": {"parse": []}})
         state.alerts[key] = now_iso()
@@ -455,6 +478,31 @@ def _primary_down_alert(cfg: Config, discord: DiscordClient | None, state: State
         state.alerts["primary_down"] = now_iso()
     except DiscordError as exc:
         log.warning("could not send the primary-down alert: %s", exc)
+
+
+def _browser_refresh_alert(cfg: Config, discord: DiscordClient | None, state: State) -> None:
+    """The daily headless visit keeps failing (read from browser-refresh.json)."""
+    from .browser_refresh import read_status
+    status = read_status(cfg.firefox_profile)
+    failures = int(status.get("consecutive_failures") or 0)
+    if failures < BROWSER_REFRESH_ALERT_FAILURES:
+        return
+    if discord is None or cfg.state_backend != "discord" or not cfg.state_channel_id:
+        return
+    now = datetime.now(timezone.utc)
+    if _fresh(state.alerts.get("browser_refresh"), now, COOKIE_ALERT_INTERVAL.total_seconds() / 60):
+        return
+    last = str(status.get("last_result") or "?")[:60]
+    message = (f"⚠️ **Bot 用 Firefox の毎日の自動更新が {failures} 回続けて失敗しています**（最後: `{last}`）。\n"
+               "メン限投稿のチェックはまだ動いていますが、このままだとログインが切れるおそれがあります。\n"
+               "対処: 主系の PC で `%LOCALAPPDATA%\\achichi-notifier\\browser-refresh.log` を確認し、Firefox が"
+               "インストールされているか確かめてください。手動で 1 回動かす場合は "
+               "`Start-ScheduledTask -TaskName achichi-notifier-browser`。")
+    try:
+        discord.send(cfg.state_channel_id, {"content": message, "allowed_mentions": {"parse": []}})
+        state.alerts["browser_refresh"] = now_iso()
+    except DiscordError as exc:
+        log.warning("could not send the browser refresh alert: %s", exc)
 
 
 DESTINATION_ALERT_INTERVAL = timedelta(hours=12)
@@ -533,12 +581,15 @@ def run(cfg: Config, role: str = "primary", dry_run: bool = False) -> int:
         runner["last_member_check"] = now_iso()
         if result.member_status == "ok":
             runner["last_member_success"] = now_iso()
-        if result.member_status == "fetch_failed":
+        if result.member_status in STREAK_STATUSES:
             runner["member_fail_streak"] = int(runner.get("member_fail_streak") or 0) + 1
         else:
             runner["member_fail_streak"] = 0
         _cookie_alert(cfg, discord, state, role, result.member_status, result.member_detail,
-                      dry_run, streak=int(runner.get("member_fail_streak") or 0))
+                      dry_run, streak=int(runner.get("member_fail_streak") or 0),
+                      source=result.cookie_source)
+    if role == "primary" and cfg.firefox_profile and not dry_run:
+        _browser_refresh_alert(cfg, discord, state)
 
     targets_all = dests.resolve(cfg, state)
     recent = _RecentlyPosted(discord) if discord is not None and not dry_run else None

@@ -619,20 +619,31 @@ class PostsPage:
 
 class YouTubeClient:
     def __init__(self, channel_id: str, cookie_text: str | None = None,
-                 cookie_error: str | None = None, timeout: float = 20.0):
+                 cookie_error: str | None = None, timeout: float = 20.0,
+                 cookie_source: str | None = None, cookie_transient: bool = False,
+                 cookies_configured: bool | None = None):
         self.channel_id = channel_id
         self.timeout = timeout
         self.session = self._new_session()
         self.session.cookies.set("SOCS", "CAI", domain=".youtube.com")  # skip consent wall
-        self.cookies_configured = bool(cookie_text or cookie_error)
+        self.cookies_configured = (bool(cookie_text or cookie_error)
+                                   if cookies_configured is None else cookies_configured)
         self.cookie_error = cookie_error
+        self.cookie_source = cookie_source
+        self.cookie_transient = cookie_transient
+        self.cookie_info: str | None = None
         self.member_session: requests.Session | None = None
         if cookie_text and not cookie_error:
             loaded = parse_cookie_text(cookie_text)
             if loaded.malformed_lines:
                 log.warning("ignored %d malformed cookie line(s)", loaded.malformed_lines)
             if not has_auth_cookies(loaded.jar):
-                self.cookie_error = "no YouTube login cookies (LOGIN_INFO / SAPISID) in the cookie data"
+                if cookie_source == "firefox":
+                    # Not logged in (yet) or logged out in the bot profile: fixable by logging in.
+                    self.cookie_error = "the Firefox profile is not logged in to YouTube (no LOGIN_INFO / SAPISID)"
+                    self.cookie_transient = True
+                else:
+                    self.cookie_error = "no YouTube login cookies (LOGIN_INFO / SAPISID) in the cookie data"
             else:
                 if "SOCS" not in {c.name for c in loaded.jar}:
                     loaded.jar.set("SOCS", "CAI", domain=".youtube.com")
@@ -641,8 +652,12 @@ class YouTubeClient:
 
     @classmethod
     def from_config(cls, cfg) -> YouTubeClient:
-        text, error = cfg.read_cookie_text()
-        return cls(cfg.youtube_channel_id, text, error)
+        source = cfg.load_cookies()
+        client = cls(cfg.youtube_channel_id, source.text, source.error,
+                     cookie_source=source.origin, cookie_transient=source.transient,
+                     cookies_configured=cfg.cookies_configured)
+        client.cookie_info = source.info
+        return client
 
     @staticmethod
     def _new_session() -> requests.Session:

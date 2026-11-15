@@ -79,6 +79,20 @@ def decode_cookie_secret(value: str) -> tuple[str | None, str | None]:
 
 
 @dataclass(frozen=True)
+class CookieSource:
+    origin: str | None  # "firefox" | "file" | "env" | None
+    text: str | None
+    error: str | None
+    transient: bool = False  # may fix itself / by logging in again (Firefox profile)
+    info: str | None = None  # counts only, never cookie names or values
+
+
+def _env_path(name: str) -> Path | None:
+    raw = _env(name)
+    return Path(os.path.expandvars(raw)).expanduser() if raw else None
+
+
+@dataclass(frozen=True)
 class Config:
     discord_token: str | None
     channel_ids: dict[str, str]
@@ -94,6 +108,9 @@ class Config:
     max_age_hours: float
     max_new_per_run: int
     member_check_minutes: int
+    firefox_profile: Path | None = None
+    firefox_exe: Path | None = None
+    refresh_seconds: int = 150
 
     @classmethod
     def from_env(cls) -> Config:
@@ -132,15 +149,35 @@ class Config:
             max_age_hours=_env_number("MAX_AGE_HOURS", 72.0, float),
             max_new_per_run=_env_number("MAX_NEW_PER_RUN", 10),
             member_check_minutes=_env_number("MEMBER_CHECK_MINUTES", 10),
+            firefox_profile=_env_path("YOUTUBE_FIREFOX_PROFILE"),
+            firefox_exe=_env_path("FIREFOX_EXE"),
+            refresh_seconds=_env_number("FIREFOX_REFRESH_SECONDS", 150),
         )
 
     @property
     def cookies_configured(self) -> bool:
-        return bool(self.cookies_file or self.cookies_secret)
+        return bool(self.firefox_profile or self.cookies_file or self.cookies_secret)
+
+    def load_cookies(self) -> CookieSource:
+        """Cookies for the member session. The bot's Firefox profile wins over files; when it
+        cannot be read there is deliberately no fallback (a silent fallback would hide the
+        problem and keep two logged-in sessions around)."""
+        if self.firefox_profile:
+            from .firefox_cookies import FirefoxCookieError, read_youtube_cookies
+            try:
+                result = read_youtube_cookies(self.firefox_profile)
+            except FirefoxCookieError as exc:
+                return CookieSource("firefox", None, f"Firefox profile: {exc}", exc.transient)
+            except (OSError, ValueError) as exc:  # unexpected; never include the message text
+                return CookieSource("firefox", None, f"Firefox profile: {exc.__class__.__name__}", True)
+            return CookieSource("firefox", result.netscape_text, None, False, result.summary())
+        text, error = self.read_cookie_text()
+        origin = "file" if self.cookies_file else "env" if self.cookies_secret else None
+        return CookieSource(origin, text, error)
 
     def read_cookie_text(self) -> tuple[str | None, str | None]:
-        """Return (cookies.txt text, error). A broken cookie setup must never stop the
-        rest of the bot, so problems are reported instead of raised."""
+        """Return (cookies.txt text, error) from YOUTUBE_COOKIES_FILE / _B64. A broken cookie
+        setup must never stop the rest of the bot, so problems are reported, not raised."""
         if self.cookies_file:
             try:
                 data = self.cookies_file.read_bytes()

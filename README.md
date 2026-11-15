@@ -126,6 +126,8 @@ uv run python -m achichi_notifier preview --send
    & "$env:LOCALAPPDATA\achichi-notifier\venv\Scripts\python.exe" -m achichi_notifier --env-file "$env:LOCALAPPDATA\achichi-notifier\.env" check
    ```
 
+   > **メン限投稿用の Cookie は「Bot 用 Firefox」がおすすめ**: `install.ps1 -FirefoxProfile` で設定します（[6.](#6-メン限投稿用の-cookie自宅の-pc-にだけ置く) の「おすすめ」）。毎日の再起動などで**サインインしていなくても動かしたい**場合は、管理者として開いた PowerShell で `-RunWithoutSignIn` を付けて実行します（パスワードは保存しない方式です）。
+
 7. **スリープしない設定にする**: 設定 → システム → 電源 → 「電源接続時に、次の時間が経過した後にデバイスをスリープ状態にする」を「なし」。スリープ中は動きません。
 
 補足:
@@ -144,6 +146,18 @@ Start-ScheduledTask -TaskName achichi-notifier
 powershell -NoProfile -ExecutionPolicy Bypass -File deploy\windows\uninstall.ps1          # タスクだけ削除
 powershell -NoProfile -ExecutionPolicy Bypass -File deploy\windows\uninstall.ps1 -Purge   # アプリと Cookie のコピーも削除
 ```
+
+#### 毎日決まった時刻に再起動する（任意）
+
+PC 全体の設定なので、**管理者として開いた PowerShell** で自分で実行してください（例: 毎日 4:00、60 秒前に予告）。Bot のタスクを `-RunWithoutSignIn` で登録しておくと、再起動後にサインインしなくても動き続けます。
+
+```powershell
+$a = New-ScheduledTaskAction -Execute "shutdown.exe" -Argument '/r /t 60 /c "Daily restart"'
+$t = New-ScheduledTaskTrigger -Daily -At 04:00
+Register-ScheduledTask -TaskName "DailyRestart" -Action $a -Trigger $t -User "SYSTEM" -RunLevel Highest -Force
+```
+
+やめるときは `Unregister-ScheduledTask -TaskName DailyRestart`。
 
 #### ミニ PC に移すとき
 
@@ -215,6 +229,35 @@ ROLE=primary ./deploy/mac/install.sh
 - **Windows 用と Mac 用は、それぞれ別のシークレットウィンドウで書き出してください**（別のセッションになり、片方が失効してももう片方が残ります。同じファイルを両方に入れると、失効も同時に起きます）。
 - GitHub などのクラウドには置かないでください。
 
+#### おすすめ: Windows は「Bot 用 Firefox」（書き出し不要）
+
+Bot 専用の Firefox プロファイルに一度ログインしておくと、Bot が**毎回そこから最新の Cookie を読みます**。さらに毎日 1 回、画面を出さずにその Firefox で YouTube を開き、ブラウザ自身にログイン状態を更新させます。Cookie の書き出しは不要になります（Chrome から書き出した Cookie が数時間で切れたのは、Chrome が Cookie を PC に結び付ける仕組みのためで、Firefox にはこの仕組みがありません）。
+
+1. PowerShell で（リモートからではなく、その PC で）:
+
+   ```powershell
+   cd $HOME\achichi-notifier
+   git pull
+   powershell -NoProfile -ExecutionPolicy Bypass -File deploy\windows\install.ps1 -FirefoxProfile
+   ```
+
+2. スタートメニューの **「achichi-notifier YouTube login」** を開く（初回はインストールのときに自動で開きます）。**通常ウィンドウ**（プライベートではない）で、メンバー加入済みのアカウントで YouTube にログインし、チャンネルに「メンバー特典」と出ることを確かめたら、**ログアウトせずにメニューから Firefox を終了**します。パスワードは保存しないでください。
+3. 確認する（「Cookie の取得元: Bot 用 Firefox プロファイル」「ログイン状態=True」「メンバー」と出れば OK）:
+
+   ```powershell
+   & "$env:LOCALAPPDATA\achichi-notifier\venv\Scripts\python.exe" -m achichi_notifier --env-file "$env:LOCALAPPDATA\achichi-notifier\.env" check
+   ```
+
+4. 毎日の更新を 1 回試す: `Start-ScheduledTask -TaskName achichi-notifier-browser`（約 3 分後に `%LOCALAPPDATA%\achichi-notifier\browser-refresh.log` に結果が出ます）
+5. 以前の `cookies.txt` は不要になるので、`%LOCALAPPDATA%\achichi-notifier\cookies.txt` を削除し、Google アカウントの「お使いのデバイス」で古いセッションをログアウトします。
+
+注意:
+
+- このプロファイルには YouTube だけでなく **Google アカウント全体のログイン状態**が入ります。本人だけが読める場所（`%LOCALAPPDATA%\achichi-notifier\firefox-profile`）に置いていますが、**このプロファイルで普段のブラウジングはしない**でください。**ほかの PC にコピーしない**でください（Mac は自分で書き出した cookies.txt のまま使います）。
+- 本当にログインが切れたとき（ログアウト・パスワード変更など）は #管理 に警告が届きます。手順 2 をもう一度行えば、5 分以内に自動で戻ります。
+
+#### 従来の方法: cookies.txt を書き出す（Mac・予備用）
+
 > ⚠️ **Cookie はアカウントへのログイン権限そのもの**です。中身をチャット・Issue・Discord・AI への質問・スクリーンショットに**絶対に貼らないでください**。ファイルの共有・コミットもしないでください。
 
 #### 書き出し方（Chrome）
@@ -285,6 +328,8 @@ Cookie に問題があっても、**動画・公開投稿の通知は止まり�
 |---|---|---|
 | Cookie を読み込めません | ファイルがない・壊れている・YouTube のログイン情報が入っていない | 書き出し直して、その PC で `install.ps1`／`install.sh` を再実行 |
 | ログイン状態になりません | Cookie の失効（ログアウト・パスワード変更・時間切れなど） | 書き出し直して `install.ps1`／`install.sh` を再実行 |
+| Bot 用 Firefox プロファイルから…取得できません（6 回続いたときだけ） | Bot 用 Firefox で未ログイン・ログアウト、または読み取りの一時的な失敗 | 「achichi-notifier YouTube login」を開いてログインし、メニューから終了 |
+| Bot 用 Firefox の毎日の自動更新が…失敗しています | Firefox がない・起動できない | `browser-refresh.log` を確認。手動で `Start-ScheduledTask -TaskName achichi-notifier-browser` |
 | ログインできていますが、メンバーではありません | 書き出したアカウントのメンバーシップが切れた（チャンネルのヘッダーが「メンバー特典」ではなく「メンバーになる」になっている）、または別アカウントで書き出した | メンバーシップを確認し、加入中のアカウントで書き出し直す |
 
 ---

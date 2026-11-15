@@ -60,6 +60,20 @@ def _safe_console() -> None:
                 pass
 
 
+def _refresh_browser(cfg: Config, dwell: float | None, url: str) -> int:
+    log = logging.getLogger("achichi_notifier")
+    if sys.platform != "win32":
+        log.info("refresh-browser only runs on Windows; nothing to do here")
+        return 0
+    if not cfg.firefox_profile:
+        log.error("YOUTUBE_FIREFOX_PROFILE is not set")
+        return 2
+    from .browser_refresh import GOOD, NOT_COUNTED, find_firefox, refresh
+    firefox = find_firefox(str(cfg.firefox_exe) if cfg.firefox_exe else None)
+    result = refresh(cfg.firefox_profile, firefox, dwell=dwell or cfg.refresh_seconds, url=url)
+    return 0 if result in GOOD + NOT_COUNTED else 1
+
+
 def _check(cfg: Config) -> int:
     """Log in through the gateway once (Discord requires this before a bot can post)
     and verify channel permissions, then check YouTube access."""
@@ -134,6 +148,19 @@ def _check(cfg: Config) -> int:
         print(f"✅ [OK] YouTube 投稿タブ（ログアウト表示）: {len(public_page.posts)} 件")
     except YouTubeError as exc:
         problems.append(f"YouTube: {exc}")
+    if cfg.firefox_profile:
+        from .browser_refresh import read_status
+        from .firefox_cookies import profile_in_use
+        print(f"ℹ️  [--] Cookie の取得元: Bot 用 Firefox プロファイル（{yt.cookie_info or '読み取りできず'}）")
+        in_use = profile_in_use(cfg.firefox_profile)
+        if in_use:
+            print("ℹ️  [--] Bot 用 Firefox が開いています（ログインが済んだらメニューから終了してください）")
+        status = read_status(cfg.firefox_profile)
+        if status:
+            print(f"ℹ️  [--] 最後の自動更新: {status.get('last_attempt', '?')} 結果={status.get('last_result', '?')}"
+                  f" 連続失敗={status.get('consecutive_failures', 0)} PSIDTS rotated={status.get('psidts_rotated')}")
+        if cfg.cookies_file or cfg.cookies_secret:
+            print("ℹ️  [--] YOUTUBE_COOKIES_FILE / B64 は使われていません（Firefox プロファイルを優先）")
     if not yt.cookies_configured:
         print("ℹ️  [--] Cookie 未設定: メン限投稿は検知されません")
     elif yt.cookie_error or not yt.has_cookies:
@@ -186,6 +213,11 @@ def main(argv: list[str] | None = None) -> int:
 
     sub.add_parser("check", help="gateway login + permission and YouTube checks")
 
+    p_ref = sub.add_parser("refresh-browser",
+                           help="Windows: open YouTube headlessly in the bot's Firefox profile (daily task)")
+    p_ref.add_argument("--dwell", type=float, help="seconds to keep the page open (default FIREFOX_REFRESH_SECONDS)")
+    p_ref.add_argument("--url", default="https://www.youtube.com/")
+
     p_dest = sub.add_parser("dest", help="manage notification destinations (other Discord servers)")
     dsub = p_dest.add_subparsers(dest="dest_command", required=True)
     dsub.add_parser("list", help="show all destinations")
@@ -228,6 +260,8 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "preview":
             from .notifier import preview
             return preview(cfg, send=args.send, dest_name=args.dest)
+        if args.command == "refresh-browser":
+            return _refresh_browser(cfg, args.dwell, args.url)
         if args.command == "dest":
             from . import dest_cli
             if args.dest_command == "list":
