@@ -134,6 +134,7 @@ if ($CookieSource) {
     Write-Host "-> Copied the cookie file to $AppCookies (members-only post checks enabled)."
     Write-Host "   The source file is no longer needed and can be deleted: $CookieSource"
 } elseif (Test-Path -LiteralPath $AppCookies) {
+    Restrict-ToCurrentUser $AppCookies
     Write-Host "-> Keeping the existing cookie file $AppCookies."
     Write-Host "   To stop using cookies: delete it and run this script again."
 }
