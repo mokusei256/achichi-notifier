@@ -101,13 +101,21 @@ def kill_leftover_headless(profile: Path) -> int:
     user opened: only processes started with --headless for this profile)."""
     if sys.platform != "win32":
         return 0
-    path = str(Path(profile)).replace("'", "''")
-    script = ("$n = 0; Get-CimInstance Win32_Process -Filter \"Name='firefox.exe'\" | "
-              f"Where-Object {{ $_.CommandLine -like '*--headless*' -and $_.CommandLine -like '*{path}*' }} | "
-              "ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue; $n++ }; $n")
+    # The path travels in an environment variable and is regex-escaped, so quotes, brackets or
+    # wildcard characters in it can neither break the script nor widen the match; the path must
+    # be a whole argument (so ...\firefox-profile-old or another profile never matches).
+    script = ("$p = $env:ACHICHI_FF_PROFILE; $n = 0; "
+              "if ($p) { $rx = '(?i)(^|[\\s\"])' + [regex]::Escape($p) + '($|[\\s\"])'; "
+              "Get-CimInstance Win32_Process -Filter \"Name='firefox.exe'\" | "
+              "Where-Object { $_.CommandLine -and "
+              "$_.CommandLine -match '(?i)(^|\\s)--?headless(\\s|$)' -and $_.CommandLine -match $rx } | "
+              "ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue; $n++ } }; $n")
+    env = _browser_env()
+    env["ACHICHI_FF_PROFILE"] = str(Path(profile))
     try:
         out = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
-                             capture_output=True, text=True, creationflags=NO_WINDOW, timeout=60)
+                             capture_output=True, text=True, creationflags=NO_WINDOW, timeout=60,
+                             env=env)
         return int((out.stdout or "0").strip().splitlines()[-1] or 0)
     except (OSError, ValueError, subprocess.TimeoutExpired, IndexError):
         return 0
@@ -123,22 +131,31 @@ def _taskkill(proc: subprocess.Popen) -> None:
         proc.kill()
 
 
+def _today() -> str:
+    return datetime.now().astimezone().date().isoformat()
+
+
 def refresh(profile: Path, firefox: Path | None, dwell: float = DEFAULT_DWELL,
             url: str = DEFAULT_URL, popen=subprocess.Popen, kill=_taskkill,
-            in_use=fc.profile_in_use, sleep=time.sleep, cleanup=kill_leftover_headless) -> str:
+            in_use=fc.profile_in_use, sleep=time.sleep, cleanup=kill_leftover_headless,
+            today=_today) -> str:
     profile = Path(profile)
     status = read_status(profile)
-    status["last_attempt"] = _now()
+    started = _now()  # written together with the result, so last_attempt always pairs with it
 
     def finish(result: str, **extra) -> str:
-        status.update(extra, last_result=result)
-        status.pop("running_since", None)
         if result == "skipped-in-use":
-            status["in_use_streak"] = int(status.get("in_use_streak") or 0) + 1
-            if status["in_use_streak"] >= IN_USE_DAYS_LIMIT:
-                result = "stuck-in-use"  # a window open at refresh time for days: likely stuck
+            day = today()
+            if status.get("in_use_last_day") != day:  # count days, not attempts (manual runs)
+                status["in_use_streak"] = int(status.get("in_use_streak") or 0) + 1
+                status["in_use_last_day"] = day
+            if int(status.get("in_use_streak") or 0) >= IN_USE_DAYS_LIMIT:
+                result = "stuck-in-use"  # in use at refresh time for days: likely left open
         else:
             status["in_use_streak"] = 0
+            status.pop("in_use_last_day", None)
+        status.update(extra, last_result=result, last_attempt=started)
+        status.pop("running_since", None)
         if result in GOOD:
             status["consecutive_failures"] = 0
             status["last_ok"] = status["last_attempt"]
@@ -168,15 +185,22 @@ def refresh(profile: Path, firefox: Path | None, dwell: float = DEFAULT_DWELL,
     except OSError as exc:
         return finish(f"launch-failed:{exc.__class__.__name__}")
     try:
-        code = proc.wait(timeout=dwell)
-        result = f"exited-early:{code}"
-    except subprocess.TimeoutExpired:
-        result = "ok"
-        kill(proc)
         try:
-            proc.wait(timeout=30)
+            code = proc.wait(timeout=dwell)
+            result = f"exited-early:{code}"
         except subprocess.TimeoutExpired:
-            result = "kill-timeout"
+            result = "ok"
+            kill(proc)
+            try:
+                proc.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                result = "kill-timeout"
+    finally:
+        if proc.poll() is None:  # interrupted or kill() raised: do not leave it running
+            try:
+                kill(proc)
+            except Exception:  # noqa: BLE001 - best effort; the next run's cleanup retries
+                log.warning("could not stop the headless Firefox")
     for _ in range(10):
         if not in_use(profile):
             break

@@ -486,19 +486,30 @@ def _browser_refresh_alert(cfg: Config, discord: DiscordClient | None, state: St
     from .browser_refresh import read_status
     status = read_status(cfg.firefox_profile)
     failures = int(status.get("consecutive_failures") or 0)
-    if failures < BROWSER_REFRESH_ALERT_FAILURES:
+    stuck = status.get("last_result") == "stuck-in-use"
+    if failures < BROWSER_REFRESH_ALERT_FAILURES and not stuck:
         return
     if discord is None or cfg.state_backend != "discord" or not cfg.state_channel_id:
         return
     now = datetime.now(timezone.utc)
     if _fresh(state.alerts.get("browser_refresh"), now, COOKIE_ALERT_INTERVAL.total_seconds() / 60):
         return
+    attempt, alerted = parse_time(status.get("last_attempt")), parse_time(state.alerts.get("browser_refresh"))
+    if attempt and alerted and attempt <= alerted:
+        return  # no new refresh attempt since the last alert (the user may have fixed it)
     last = str(status.get("last_result") or "?")[:60]
-    message = (f"⚠️ **Bot 用 Firefox の毎日の自動更新が {failures} 回続けて失敗しています**（最後: `{last}`）。\n"
-               "メン限投稿のチェックはまだ動いていますが、このままだとログインが切れるおそれがあります。\n"
-               "対処: 主系の PC で `%LOCALAPPDATA%\\achichi-notifier\\browser-refresh.log` を確認し、Firefox が"
-               "インストールされているか確かめてください。手動で 1 回動かす場合は "
-               "`Start-ScheduledTask -TaskName achichi-notifier-browser`。")
+    if stuck:
+        days = int(status.get("in_use_streak") or 0)
+        message = (f"⚠️ **Bot 用 Firefox が {days} 日続けて「使用中」で、毎日の自動更新ができていません**。\n"
+                   "ログイン用ショートカット（achichi-notifier YouTube login）で開いた Firefox を開いたままに"
+                   "していないか確認し、閉じてください。ウィンドウが見当たらない場合はタスク マネージャーで"
+                   "firefox.exe を終了するか、PC を再起動してください。")
+    else:
+        message = (f"⚠️ **Bot 用 Firefox の毎日の自動更新が {failures} 回続けて失敗しています**（最後: `{last}`）。\n"
+                   "メン限投稿のチェックはまだ動いていますが、このままだとログインが切れるおそれがあります。\n"
+                   "対処: 主系の PC で `%LOCALAPPDATA%\\achichi-notifier\\browser-refresh.log` を確認し、Firefox が"
+                   "インストールされているか確かめてください。手動で 1 回動かす場合は "
+                   "`Start-ScheduledTask -TaskName achichi-notifier-browser`。")
     try:
         discord.send(cfg.state_channel_id, {"content": message, "allowed_mentions": {"parse": []}})
         state.alerts["browser_refresh"] = now_iso()
@@ -509,24 +520,127 @@ def _browser_refresh_alert(cfg: Config, discord: DiscordClient | None, state: St
 DESTINATION_ALERT_INTERVAL = timedelta(hours=12)
 
 
+UNDELIVERED_RETRY_HOURS = 2
+
+
+def _targets_by_channel(targets_all, kind: str) -> dict[str, tuple]:
+    """channel -> (first destination, combined mention). Destinations that share a channel get
+    one message carrying every mention, instead of the second one being silently dropped."""
+    out: dict[str, tuple] = {}
+    for dest in targets_all:
+        channel = dest.channel_for(kind) if dest.wants(kind) else None
+        if not channel:
+            continue
+        mention = dest.mention_for(kind)
+        if channel in out:
+            first, combined = out[channel]
+            parts = (combined or "").split()
+            for part in (mention or "").split():
+                if part not in parts:
+                    parts.append(part)
+            out[channel] = (first, " ".join(parts) or None)
+        else:
+            out[channel] = (dest, mention)
+    return out
+
+
+def _retry_undelivered(state: State, discord: DiscordClient, recent, targets_all=()) -> int:
+    """Re-send notifications that missed one channel because of temporary trouble.
+    Uses the settings as they are now: if no destination takes this kind on this channel any
+    more (kinds changed, channel moved, disabled, removed) the retry is dropped, and the mention
+    is the one configured now (combined when destinations share the channel)."""
+    sent = 0
+    now = datetime.now(timezone.utc)
+    for entry in state.undelivered.values():
+        if entry.get("done"):
+            continue
+        channel, url, kind = entry.get("channel"), entry.get("url"), str(entry.get("kind") or "")
+        payload = entry.get("payload")
+        current = _targets_by_channel(targets_all, kind).get(channel) if kind in render.GROUPS else None
+        if current is None or not isinstance(payload, dict):
+            entry["done"] = now_iso()  # nobody takes this kind on this channel now: drop quietly
+            continue
+        dest, mention = current
+        entry["dest"] = dest.name  # who takes this channel now (for the #管理 report)
+        if recent is not None and recent.contains(channel, url):
+            entry["done"] = now_iso()  # an earlier try did reach Discord after all
+            continue
+        first = parse_time(entry.get("first")) or now
+        if first.tzinfo is None:
+            first = first.replace(tzinfo=timezone.utc)
+        if now - first > timedelta(hours=UNDELIVERED_RETRY_HOURS):
+            tries = int(entry.get("tries") or 1)
+            entry["done"] = entry["lost"] = now_iso()  # reported by _lost_alert
+            entry["why"] = (f"最初の失敗から {UNDELIVERED_RETRY_HOURS} 時間を過ぎました。"
+                            f"送信を試したのは {tries} 回"
+                            + ("（PC が止まっていた可能性があります）" if tries <= 2 else ""))
+            continue
+        try:
+            discord.send(channel, render.apply_mention(payload, mention))
+            entry["done"] = now_iso()
+            sent += 1
+            if recent is not None:
+                recent.add(channel, url)
+            log.info("re-sent a %s notification to %s", kind, dest.name)
+        except DiscordError as exc:
+            entry["tries"] = int(entry.get("tries") or 0) + 1
+            if not exc.transient:  # e.g. the bot lost access meanwhile
+                entry["done"] = entry["lost"] = now_iso()
+                entry["why"] = str(exc)[:120]
+    return sent
+
+
+def _lost_alert(cfg: Config, discord: DiscordClient | None, state: State) -> None:
+    """List every notification that was given up for a destination. Not time-throttled
+    (each one is reported once), so no lost notification goes unmentioned."""
+    if discord is None or cfg.state_backend != "discord" or not cfg.state_channel_id:
+        return
+    by_dest: dict[str, list[dict]] = {}
+    for key, entry in state.undelivered.items():
+        if entry.get("lost") and not entry.get("reported"):
+            by_dest.setdefault(str(entry.get("dest") or key.split("|", 1)[0]), []).append(entry)
+    for name, entries in sorted(by_dest.items()):
+        lines = "\n".join(f"・<{e.get('url') or '-'}>（チャンネル {e.get('channel') or '?'}: "
+                          f"{str(e.get('why') or '?')[:120]}）" for e in entries[:10])
+        more = f"\nほか {len(entries) - 10} 件" if len(entries) > 10 else ""
+        message = (f"⚠️ **送り先「{name}」に次の通知を届けられず、送り直しを打ち切りました**\n"
+                   f"{lines}{more}\n必要ならそのサーバーに手動で投稿してください。"
+                   "権限のエラー（HTTP 403 など）なら `uv run python -m achichi_notifier dest check "
+                   f"{name}` で確認できます。")
+        try:
+            discord.send(cfg.state_channel_id, {"content": message, "allowed_mentions": {"parse": []}})
+        except DiscordError as exc:
+            log.warning("could not send the lost-notification alert: %s", exc)
+            continue  # stays unreported: tried again next run
+        stamp = now_iso()
+        for entry in entries:
+            entry["reported"] = stamp
+
+
 def _destination_alert(cfg: Config, discord: DiscordClient | None, state: State,
-                       failures: dict[str, tuple[str, str, bool]]) -> None:
-    """Some destination could not be posted to (bot removed, missing permission, deleted
-    channel, or temporary trouble that will be retried)."""
+                       failures: dict[tuple[str, str], list[tuple[str, str | None]]]) -> None:
+    """Some destination could not be posted to. Temporary and permanent problems are
+    throttled separately (12h); notifications given up for good are listed by _lost_alert."""
     if discord is None or cfg.state_backend != "discord" or not cfg.state_channel_id:
         return
     now = datetime.now(timezone.utc)
-    for name, (detail, url, transient) in failures.items():
-        key = f"destination:{name}"
+    for (name, category), details in failures.items():
+        key = f"destination:{name}:{'permanent' if category == 'permanent' else 'temporary'}"
         if _fresh(state.alerts.get(key), now, DESTINATION_ALERT_INTERVAL.total_seconds() / 60):
             continue
-        if transient:
-            cause = "一時的なエラーのようです。次の確認で自動的にもう一度送ります。"
+        if category == "temporary":
+            cause = ("一時的なエラーのようです。ほかの送り先には届いています。この送り先にだけ、最初の失敗から"
+                     f"最大 {UNDELIVERED_RETRY_HOURS} 時間、自動でもう一度送ります（すでに届いた送り先には重複しません）。")
+        elif category == "everywhere":
+            cause = ("一時的なエラーのようです。どの送り先にも届かなかったので、次の確認からすべての送り先に"
+                     f"もう一度送ります（届くまで毎回。公開から {cfg.max_age_hours:g} 時間を過ぎたものは送りません）。")
         else:
-            cause = ("Bot がそのサーバーにいるか、チャンネルの権限（見る・送信・埋め込みリンク・履歴を読む）を確認してください。"
+            cause = ("**この送り先には届いていません。** Bot がそのサーバーにいるか、チャンネルの権限"
+                     "（見る・送信・埋め込みリンク・履歴を読む）を確認してください。"
                      "\n確認: `uv run python -m achichi_notifier dest check " + name + "`")
-        message = (f"⚠️ **送り先「{name}」に通知を送れませんでした**\n`{detail[:300]}`\n"
-                   + (f"対象: <{url}>\n" if url else "") + cause)
+        # The link stays outside the cut so a long Discord error body can never hide it.
+        lines = "\n".join(f"・<{url or '-'}> `{detail[:160]}`" for detail, url in details[:5])
+        message = f"⚠️ **送り先「{name}」に通知を送れませんでした**\n{lines}\n{cause}"
         try:
             discord.send(cfg.state_channel_id, {"content": message, "allowed_mentions": {"parse": []}})
             state.alerts[key] = now_iso()
@@ -575,6 +689,11 @@ def run(cfg: Config, role: str = "primary", dry_run: bool = False) -> int:
     if role == "fallback" and _primary_is_fresh(state, cfg, now):
         if not _member_check_due(state, cfg, yt, now):
             log.debug("primary runner is healthy; fallback skipped")
+            runner = state.runners.setdefault(role, {})
+            if runner.get("features") != list(FEATURES) and not dry_run:
+                runner["features"] = list(FEATURES)  # once after an update, so `dest` stops warning
+                state.owner_role = role
+                store.save(state)
             return 0
         mode = "members"
 
@@ -604,18 +723,21 @@ def run(cfg: Config, role: str = "primary", dry_run: bool = False) -> int:
     targets_all = dests.resolve(cfg, state)
     recent = _RecentlyPosted(discord) if discord is not None and not dry_run else None
     send_failures = skipped = delivered_total = 0
-    failed_destinations: dict[str, tuple[str, str, bool]] = {}
+    failed_destinations: dict[tuple[str, str], list[tuple[str, str | None]]] = {}
+
+    def record_failure(name: str, category: str, detail: str, url: str | None) -> None:
+        """category: "permanent", "temporary" (retried for this channel only) or
+        "everywhere" (reached no destination: the whole item is tried again next run)."""
+        failed_destinations.setdefault((name, category), []).append((detail, url))
+
+    if not dry_run and discord is not None:
+        delivered_total += _retry_undelivered(state, discord, recent, targets_all)
     for note in result.notifications:
-        targets = [(d, d.channel_for(note.kind)) for d in targets_all if d.wants(note.kind)]
-        targets = [(d, ch) for d, ch in targets if ch]
+        targets = _targets_by_channel(targets_all, note.kind)
         sent_or_present = 0
-        retry_later = False
-        handled_channels: set[str] = set()
-        for dest, channel in targets:
-            if channel in handled_channels:  # two destinations pointing at one channel
-                continue
-            handled_channels.add(channel)
-            payload = render.apply_mention(note.payload, dest.mention_for(note.kind))
+        temporary: list[tuple[str, str, dict, DiscordError]] = []
+        for channel, (dest, mention) in targets.items():
+            payload = render.apply_mention(note.payload, mention)
             if dry_run:
                 print(f"--- [dry-run] {note.kind} -> {dest.name} channel {channel}")
                 print(json.dumps(payload, ensure_ascii=False, indent=2))
@@ -632,14 +754,25 @@ def run(cfg: Config, role: str = "primary", dry_run: bool = False) -> int:
                     if recent is not None:
                         recent.add(channel, note.url)
                 except DiscordError as exc:
-                    # Temporary trouble: keep the item unseen so the next run retries; channels
-                    # that already got it are skipped then by the recent-links guard.
-                    retry_later = retry_later or exc.transient
-                    failed_destinations[dest.name] = (f"{channel}: {exc}", note.url or "", exc.transient)
                     log.error("failed to send a %s notification to %s: %s", note.kind, dest.name, exc)
-        if targets and (not sent_or_present or retry_later):
+                    if exc.transient:
+                        temporary.append((dest.name, channel, payload, exc))
+                    else:
+                        record_failure(dest.name, "permanent", f"{channel}: {exc}", note.url)
+        if targets and not sent_or_present:
+            # Delivered nowhere: keep the item unseen so the next run tries every destination.
             send_failures += 1
+            for name, channel, _payload, exc in temporary:
+                record_failure(name, "everywhere", f"{channel}: {exc}", note.url)
             continue
+        for name, channel, _payload, exc in temporary:
+            # Delivered elsewhere: retry only this destination for a while (no duplicates).
+            # The payload is kept without mention: the retry adds the mention configured then.
+            state.undelivered[f"{name}|{note.item_type}|{note.item_id}"] = {
+                "channel": channel, "payload": note.payload, "url": note.url, "kind": note.kind,
+                "first": now_iso(), "tries": 1, "done": None, "lost": None, "reported": None,
+            }
+            record_failure(name, "temporary", f"{channel}: {exc}", note.url)
         target = state.videos if note.item_type == "video" else state.posts
         target[note.item_id] = now_iso()
         state.pending.pop(note.item_id, None)
@@ -648,6 +781,8 @@ def run(cfg: Config, role: str = "primary", dry_run: bool = False) -> int:
                      note.kind, note.item_id, sent_or_present)
     if failed_destinations and not dry_run:
         _destination_alert(cfg, discord, state, failed_destinations)
+    if not dry_run:
+        _lost_alert(cfg, discord, state)
 
     runner["last_run"] = now_iso()
     runner["host"] = "github-actions" if _in_github() else "local"

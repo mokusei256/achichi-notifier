@@ -230,6 +230,8 @@ def main(argv: list[str] | None = None) -> int:
     for key in ("video", "short", "live", "post", "member_post"):
         d_add.add_argument(f"--mention-{key.replace('_', '-')}", dest=f"mention_{key}",
                            help=f"mention for {key}, e.g. '<@&ROLE_ID>' or @everyone")
+    d_add.add_argument("--clear-mentions", action="store_true",
+                       help="drop the mentions saved earlier (then apply only the --mention-* given now)")
     d_rm = dsub.add_parser("remove", help="delete a destination")
     d_rm.add_argument("name")
     for verb in ("enable", "disable"):

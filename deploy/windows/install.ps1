@@ -166,6 +166,16 @@ if ($UseS4U) {
         Fail "The tasks run without sign-in (S4U), which needs an administrator PowerShell: right-click PowerShell > Run as administrator, then run this again (or add -SignInOnly to switch back)."
     }
 }
+# "Run as administrator" with a separate admin account would install everything (tasks, app
+# folder, Firefox profile) for that account instead of the person who uses this PC.
+$consoleUser = $null
+try { $consoleUser = (Get-CimInstance Win32_ComputerSystem -ErrorAction Stop).UserName } catch { $consoleUser = $null }
+if ($consoleUser -and ($consoleUser -ine $Account)) {
+    Write-Host "WARNING: this PowerShell runs as $Account, but $consoleUser is signed in on the screen." -ForegroundColor Yellow
+    Write-Host "         The bot, its tasks and the Firefox login will belong to $Account." -ForegroundColor Yellow
+    Write-Host "         If that is not intended, press Ctrl+C now and run this as $consoleUser." -ForegroundColor Yellow
+    Start-Sleep -Seconds 10
+}
 
 $CookieSource = $null
 if ($Cookies) {

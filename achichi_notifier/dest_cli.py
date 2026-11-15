@@ -38,21 +38,22 @@ def _warn_old_runners(state) -> None:
                   "Windows は git pull → install.ps1、Mac は ./deploy/mac/install.sh で更新してください。")
 
 
-def _save_destinations(store, mutate) -> bool:
+def _save_destinations(store, mutate, name: str):
     """Apply mutate(state) and save; re-check because a runner saving at the same moment can
-    overwrite the change (Discord has no compare-and-swap). Returns True when it stuck."""
+    overwrite the change (Discord has no compare-and-swap). Returns the re-read state when the
+    entry for `name` is stored exactly as written (or is gone, for a removal), else None."""
     for _ in range(3):
         state = store.load()
         mutate(state)
         state.destinations_updated = now_iso()
-        stamp = state.destinations_updated
-        expected = {k: dict(v) for k, v in state.destinations.items()}
+        expected = state.destinations.get(name)
+        expected = dict(expected) if expected is not None else None
         store.save(state)
         time.sleep(2)
         check = store.load()
-        if check.destinations_updated == stamp or check.destinations == expected:
-            return True
-    return False
+        if check.destinations.get(name) == expected:
+            return check
+    return None
 
 
 def _describe_channel(discord: DiscordClient, channel_id: str) -> str:
@@ -73,9 +74,7 @@ def cmd_list(cfg: Config) -> int:
         mentions = ", ".join(f"{k}={v}" for k, v in sorted(dest.mentions.items())) or "-"
         source = ".env" if dest.name == dests.MAIN else "dest add"
         print(f"[{status}] {dest.name} ({source})")
-        print(f"      channels: {channels}")
-        print(f"      kinds:    {', '.join(sorted(dest.kinds))}")
-        print(f"      mentions: {mentions}")
+        _print_destination(dest)
     return 0
 
 
@@ -119,10 +118,12 @@ def cmd_add(cfg: Config, args) -> int:
     state = store.load()
     _warn_old_runners(state)
     existed = name in state.destinations
+    before = dests.Destination.from_dict(name, state.destinations[name]) if existed else None
+    clear = bool(getattr(args, "clear_mentions", False))
 
     def mutate(st) -> None:
         old = dests.Destination.from_dict(name, st.destinations[name]) if name in st.destinations else None
-        merged_mentions = dict(old.mentions) if old else {}
+        merged_mentions = dict(old.mentions) if old and not clear else {}
         merged_mentions.update(mentions)  # re-adding keeps mentions/kinds/enabled you did not pass
         st.destinations[name] = dests.Destination(
             name=name, channels=channels, mentions=merged_mentions,
@@ -130,12 +131,39 @@ def cmd_add(cfg: Config, args) -> int:
             enabled=old.enabled if old else True,
         ).to_dict()
 
-    if not _save_destinations(store, mutate):
+    saved_state = _save_destinations(store, mutate, name)
+    if saved_state is None or name not in saved_state.destinations:
         print("❌ [NG] 保存できませんでした（同時に Bot が状態を書き換えた可能性）。もう一度実行してください。")
         return 1
-    print(f"✅ [OK] 送り先「{name}」を{'更新' if existed else '追加'}しました。次の確認（5 分以内）から通知が届きます。")
+    saved = dests.Destination.from_dict(name, saved_state.destinations[name])
+    print(f"✅ [OK] 送り先「{name}」を{'更新' if existed else '追加'}しました。保存された内容:")
+    _print_destination(saved)
+    if before:
+        dropped = sorted(set(before.channels) - set(saved.channels))
+        if dropped:
+            print(f"   ※ 前の {', '.join(dropped)} 用チャンネルは外しました（チャンネルは毎回指定した分だけになります）。")
+        if before.mentions and not mentions and not clear:
+            print("   ※ メンションは前のまま残しています（消すときは --clear-mentions）。")
+    for other in dests.resolve(cfg, saved_state):
+        shared = sorted(set(other.all_channels()) & set(saved.all_channels()))
+        if other.name != name and shared:
+            print(f"   ⚠️  チャンネル {', '.join(shared)} は送り先「{other.name}」でも使われています。"
+                  "同じチャンネルには 1 回だけ送り、メンションはまとめて付けます。")
+    if not saved.enabled:
+        print(f"⚠️  [!!] この送り先は停止中です。送るには: uv run python -m achichi_notifier dest enable {name}")
+    else:
+        print("   次の確認（5 分以内）から通知が届きます。")
     print("   テスト送信: uv run python -m achichi_notifier dest check " + name + " --send-test")
     return 0
+
+
+def _print_destination(dest) -> None:
+    channels = ", ".join(f"{k}={v}" for k, v in sorted(dest.channels.items()))
+    mentions = ", ".join(f"{k}={v}" for k, v in sorted(dest.mentions.items())) or "-"
+    print(f"      状態:      {'有効' if dest.enabled else '停止中'}")
+    print(f"      channels: {channels}")
+    print(f"      kinds:    {', '.join(k for k in dests.KIND_CHOICES if k in dest.kinds)}")
+    print(f"      mentions: {mentions}")
 
 
 def cmd_remove(cfg: Config, name: str) -> int:
@@ -144,7 +172,7 @@ def cmd_remove(cfg: Config, name: str) -> int:
     if name not in store.load().destinations:
         print(f"送り先「{name}」はありません（main は .env で設定します）。")
         return 1
-    if not _save_destinations(store, lambda st: st.destinations.pop(name, None)):
+    if _save_destinations(store, lambda st: st.destinations.pop(name, None), name) is None:
         print("❌ [NG] 保存できませんでした。もう一度実行してください。")
         return 1
     print(f"✅ [OK] 送り先「{name}」を削除しました。")
@@ -162,7 +190,7 @@ def cmd_enable(cfg: Config, name: str, enabled: bool) -> int:
         if name in st.destinations:
             st.destinations[name]["enabled"] = enabled
 
-    if not _save_destinations(store, mutate):
+    if _save_destinations(store, mutate, name) is None:
         print("❌ [NG] 保存できませんでした。もう一度実行してください。")
         return 1
     print(f"✅ [OK] 送り先「{name}」を{'有効' if enabled else '停止'}にしました。")
