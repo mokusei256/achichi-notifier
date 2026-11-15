@@ -61,12 +61,18 @@ function Wait-TaskIdle([string]$Name) {
     }
 }
 
+# The signed-in account as Windows knows it (e.g. DESKTOP-ABC\name). $env:USERDOMAIN is not
+# reliable: in an SSH session it is "WORKGROUP", which maps to no account.
+$Account = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+
 function Restrict-ToCurrentUser([string]$Path) {
     # %LOCALAPPDATA% is already private to the user; this also drops inherited entries.
-    $account = "$env:USERDOMAIN\$env:USERNAME"
-    & icacls.exe $Path /inheritance:r /grant:r "${account}:F" | Out-Null
+    # Local "Continue": with "Stop", Windows PowerShell 5.1 turns a native command's stderr
+    # into a terminating error.
+    $ErrorActionPreference = "Continue"
+    $out = & icacls.exe $Path /inheritance:r /grant:r "${Account}:F" 2>&1
     if ($LASTEXITCODE -ne 0) {
-        Write-Host "WARNING: could not restrict permissions on $Path" -ForegroundColor Yellow
+        Write-Host "WARNING: could not restrict permissions on $Path ($out)" -ForegroundColor Yellow
     }
 }
 
@@ -150,7 +156,6 @@ if (-not (Test-Path -LiteralPath $PythonW)) {
     $Exe = $Python
 }
 $Arguments = "-m achichi_notifier --env-file `"$AppEnv`" --log-file `"$LogFile`" run --role $Role"
-$Account = "$env:USERDOMAIN\$env:USERNAME"
 
 $Action = New-ScheduledTaskAction -Execute $Exe -Argument $Arguments -WorkingDirectory $AppDir
 $Every = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) `
