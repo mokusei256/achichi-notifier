@@ -95,10 +95,12 @@ uv run python -m achichi_notifier preview --send
    winget install --id=astral-sh.uv -e
    ```
 
-2. コードを取ってくる
+   Windows 10 では winget が「ソースを更新できませんでした」で失敗することがあります。その場合 uv は、[公式の配布ページ](https://github.com/astral-sh/uv/releases)の `uv-x86_64-pc-windows-msvc.zip` を展開して `uv.exe` を `%USERPROFILE%\.local\bin` に置き、そのフォルダをユーザーの PATH に追加すれば使えます（チェックサム `.sha256` で照合してください）。
+
+2. コードを取ってくる。**「ドキュメント」には置かない**でください（OneDrive と同期されていることが多く、トークン入りの `.env` や Cookie がクラウドに上がります）
 
    ```powershell
-   cd $HOME\Documents
+   cd $HOME
    git clone https://github.com/mokusei256/achichi-notifier
    cd achichi-notifier
    ```
@@ -131,7 +133,7 @@ uv run python -m achichi_notifier preview --send
 - アプリは `%LOCALAPPDATA%\achichi-notifier` にコピーして動かします（`.env` と Cookie は本人だけが読める権限）。画面は出ず、ログは `notifier.log` に書かれます（1MB ごとに切り替え）。
 - タスクは**サインインしている間**に動きます（画面がロックされていても動きます）。手動で再起動したらサインインしてください。
 - Windows Update の自動再起動のあとも動き続けるように、**設定 → アカウント → サインイン オプション →「更新後にサインイン情報を使用して、デバイスのセットアップを自動的に完了する」を オン**にしておいてください（オフだと、誰かがサインインするまで止まります。そのあいだは Mac が代わりに確認し、#管理 に「主系の PC が止まっています」と届きます）。
-- コードを更新するとき: `cd $HOME\Documents\achichi-notifier` → `git pull` → `install.ps1` をもう一度実行。`.env` や Cookie を変えたときも `install.ps1` を再実行します（実行中の確認が終わるのを待ってから入れ替えます）。
+- コードを更新するとき: `cd $HOME\achichi-notifier` → `git pull` → `install.ps1` をもう一度実行。`.env` や Cookie を変えたときも `install.ps1` を再実行します（実行中の確認が終わるのを待ってから入れ替えます）。
 - 主系を Windows に移したら、Mac 側はそのまま予備系として動きます（設定変更は不要）。
 
 ログを見る／今すぐ 1 回動かす／止める:
@@ -148,7 +150,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File deploy\windows\uninstall.ps1
 新しい PC で 1〜7 をやり直し、動いたのを確認してから古い Windows で次を実行します（タスクとアプリ・Cookie のコピーを削除し、クローンに残った `.env` も消します）。
 
 ```powershell
-cd $HOME\Documents\achichi-notifier
+cd $HOME\achichi-notifier
 powershell -NoProfile -ExecutionPolicy Bypass -File deploy\windows\uninstall.ps1 -Purge
 Remove-Item .\.env
 ```
@@ -234,7 +236,7 @@ Chrome で書き出した Cookie が数時間で失効してしまう場合は�
 書き出したファイルを、[4.](#4-windows-pc主系) で `git clone` したフォルダに `cookies.txt` という名前で置き、`install.ps1` を再実行します（PowerShell）。
 
 ```powershell
-cd $HOME\Documents\achichi-notifier
+cd $HOME\achichi-notifier
 Move-Item $HOME\Downloads\www.youtube.com_cookies.txt .\cookies.txt
 powershell -NoProfile -ExecutionPolicy Bypass -File deploy\windows\install.ps1
 Remove-Item .\cookies.txt    # アプリ側にコピーされたので元は削除
