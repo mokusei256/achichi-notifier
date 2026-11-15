@@ -23,7 +23,8 @@ def load_dotenv(path: Path) -> None:
     """Minimal .env loader. Existing environment variables win."""
     if not path.is_file():
         return
-    for raw in path.read_text(encoding="utf-8").splitlines():
+    # utf-8-sig: files saved by Windows PowerShell 5.1 start with a BOM
+    for raw in path.read_text(encoding="utf-8-sig").splitlines():
         line = raw.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue

@@ -11,6 +11,7 @@ import argparse
 import logging
 import os
 import sys
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 from .config import Config, ConfigError, load_dotenv
@@ -30,16 +31,33 @@ class _GitHubFormatter(logging.Formatter):
         return line
 
 
-def _setup_logging(verbose: bool) -> None:
-    handler = logging.StreamHandler(sys.stderr)
+def _setup_logging(verbose: bool, log_file: str | None = None) -> None:
     fmt = "%(asctime)s %(levelname)s %(name)s: %(message)s"
-    if os.environ.get("GITHUB_ACTIONS") == "true":
-        handler.setFormatter(_GitHubFormatter(fmt))
-    else:
-        handler.setFormatter(logging.Formatter(fmt))
-    logging.basicConfig(level=logging.DEBUG if verbose else logging.INFO, handlers=[handler])
+    formatter = (_GitHubFormatter(fmt) if os.environ.get("GITHUB_ACTIONS") == "true"
+                 else logging.Formatter(fmt))
+    handlers: list[logging.Handler] = []
+    if log_file:
+        # Windows Task Scheduler runs pythonw.exe without a console, so logs go to a file.
+        path = Path(log_file).expanduser()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        handlers.append(RotatingFileHandler(path, maxBytes=1_000_000, backupCount=3, encoding="utf-8"))
+    if sys.stderr is not None:  # None under pythonw.exe
+        handlers.append(logging.StreamHandler(sys.stderr))
+    for handler in handlers:
+        handler.setFormatter(formatter)
+    logging.basicConfig(level=logging.DEBUG if verbose else logging.INFO, handlers=handlers, force=True)
     logging.getLogger("urllib3").setLevel(logging.WARNING)
     logging.getLogger("discord").setLevel(logging.ERROR)
+
+
+def _safe_console() -> None:
+    """Never crash on characters the console encoding cannot show (e.g. cp932 + emoji)."""
+    for stream in (sys.stdout, sys.stderr):
+        if stream is not None and hasattr(stream, "reconfigure"):
+            try:
+                stream.reconfigure(errors="backslashreplace")
+            except (ValueError, OSError):
+                pass
 
 
 def _check(cfg: Config) -> int:
@@ -62,7 +80,7 @@ def _check(cfg: Config) -> int:
         @client.event
         async def on_ready() -> None:
             try:
-                print(f"✅ Bot としてログイン: {client.user} (id={client.user.id})")
+                print(f"✅ [OK] Bot としてログイン: {client.user} (id={client.user.id})")
                 targets = {f"通知({k})": cid for k, cid in cfg.channel_ids.items()}
                 if cfg.state_backend == "discord":
                     targets["状態保存"] = cfg.state_channel_id
@@ -80,7 +98,7 @@ def _check(cfg: Config) -> int:
                     if missing:
                         problems.append(f"{label} #{channel.name}: 権限不足 → " + ", ".join(missing))
                     else:
-                        print(f"✅ {label}: #{channel.name} ({channel.guild.name})")
+                        print(f"✅ [OK] {label}: #{channel.name} ({channel.guild.name})")
             finally:
                 await client.close()
 
@@ -100,13 +118,13 @@ def _check(cfg: Config) -> int:
     public_page = None
     try:
         refs, title = yt.fetch_rss()
-        print(f"✅ YouTube RSS: {title} / {len(refs)} 件")
+        print(f"✅ [OK] YouTube RSS: {title} / {len(refs)} 件")
         public_page = yt.fetch_posts_page(member=False)
-        print(f"✅ YouTube 投稿タブ（ログアウト表示）: {len(public_page.posts)} 件")
+        print(f"✅ [OK] YouTube 投稿タブ（ログアウト表示）: {len(public_page.posts)} 件")
     except YouTubeError as exc:
         problems.append(f"YouTube: {exc}")
     if not yt.cookies_configured:
-        print("ℹ️  Cookie 未設定: メン限投稿は検知されません")
+        print("ℹ️  [--] Cookie 未設定: メン限投稿は検知されません")
     elif yt.cookie_error or not yt.has_cookies:
         problems.append(f"Cookie: {yt.cookie_error}")
     else:
@@ -121,7 +139,7 @@ def _check(cfg: Config) -> int:
             badge, by_comparison = (classify_member_posts(member_page, comparable)
                                     if member_page.logged_in and not problem else ([], []))
             ok = member_page.logged_in and member_page.membership != "not_member" and not problem
-            print(f"{'✅' if ok else '❌'} Cookie: ログイン状態={member_page.logged_in}"
+            print(f"{'✅ [OK]' if ok else '❌ [NG]'} Cookie: ログイン状態={member_page.logged_in}"
                   f" / 加入状態={label.get(member_page.membership, member_page.membership)}"
                   f" / メン限投稿 {len(badge) + len(by_comparison)} 件（内容は表示しません）")
             if not member_page.logged_in:
@@ -132,7 +150,7 @@ def _check(cfg: Config) -> int:
                 problems.append(f"Cookie 付きの投稿タブが想定外の形です（{problem}）")
 
     for problem in problems:
-        print(f"❌ {problem}")
+        print(f"❌ [NG] {problem}")
     return 1 if problems else 0
 
 
@@ -140,6 +158,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="achichi_notifier")
     parser.add_argument("--env-file", default=".env", help="path to .env (default: ./.env)")
     parser.add_argument("-v", "--verbose", action="store_true")
+    parser.add_argument("--log-file", help="also write logs to this file (rotated at 1MB)")
     sub = parser.add_subparsers(dest="command", required=True)
 
     p_run = sub.add_parser("run", help="check YouTube once and post new items")
@@ -156,7 +175,11 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("check", help="gateway login + permission and YouTube checks")
 
     args = parser.parse_args(argv)
-    _setup_logging(args.verbose)
+    _safe_console()
+    _setup_logging(args.verbose, args.log_file)
+    if sys.stderr is None:
+        sys.excepthook = lambda kind, value, tb: logging.getLogger("achichi_notifier").critical(
+            "uncaught error", exc_info=(kind, value, tb))
     load_dotenv(Path(args.env_file))
     if getattr(args, "state_file", None):
         os.environ["STATE_BACKEND"] = "file"
@@ -179,6 +202,9 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     except (DiscordError, YouTubeError) as exc:
         logging.getLogger("achichi_notifier").error("%s", exc)
+        return 1
+    except Exception:  # pythonw.exe has no console: make sure the traceback reaches the log
+        logging.getLogger("achichi_notifier").exception("unexpected error")
         return 1
     return 0
 

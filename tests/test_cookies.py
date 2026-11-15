@@ -105,3 +105,26 @@ def test_member_cookies_never_reach_the_logged_out_session():
     assert "SAPISID=" in member_header and "LOGIN_INFO=" in member_header
     assert "SAPISID" not in public_header and "LOGIN_INFO" not in public_header
     assert "SOCS=CAI" in public_header
+
+
+def test_dotenv_with_bom_and_crlf(tmp_path, monkeypatch):
+    from achichi_notifier.config import load_dotenv
+    env = tmp_path / ".env"
+    env.write_bytes("﻿ACHICHI_TEST_A=1\r\nACHICHI_TEST_B=\"two\"\r\n".encode("utf-8"))
+    monkeypatch.delenv("ACHICHI_TEST_A", raising=False)
+    monkeypatch.delenv("ACHICHI_TEST_B", raising=False)
+    load_dotenv(env)
+    import os
+    assert os.environ["ACHICHI_TEST_A"] == "1" and os.environ["ACHICHI_TEST_B"] == "two"
+
+
+def test_log_file_option_writes_utf8(tmp_path):
+    import logging
+    from achichi_notifier.__main__ import _setup_logging
+    log_path = tmp_path / "logs" / "notifier.log"
+    _setup_logging(False, str(log_path))
+    logging.getLogger("achichi_notifier").info("テスト 🔒")
+    for handler in logging.getLogger().handlers:
+        handler.flush()
+    assert "テスト 🔒" in log_path.read_text(encoding="utf-8")
+    _setup_logging(False, None)

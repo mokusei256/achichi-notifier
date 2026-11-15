@@ -228,14 +228,22 @@ def test_member_check_respects_interval(tmp_path, capsys):
     assert FakeYouTube.calls == []
 
 
-def test_fallback_skips_member_check_when_primary_has_working_cookies(tmp_path, capsys):
+def test_fallback_only_self_checks_daily_when_primary_has_working_cookies(tmp_path, capsys):
     cfg = _cfg(tmp_path)
     FakeYouTube.member_posts = list(FakeYouTube.public_posts)
     _run(cfg, capsys, role="primary")  # primary with cookies
     assert "last_member_success" in _state(tmp_path)["runners"]["primary"]
     FakeYouTube.calls = []
-    _run(cfg, capsys, role="fallback")
+    _run(cfg, capsys, role="fallback")  # first time: daily self-check of the spare cookies
+    assert "posts-member" in FakeYouTube.calls
+    FakeYouTube.calls = []
+    _run(cfg, capsys, role="fallback")  # within 24h: nothing to do
     assert FakeYouTube.calls == []
+    state = _state(tmp_path)
+    state["runners"]["fallback"]["last_member_check"] = "2000-01-01T00:00:00+00:00"
+    _write_state(tmp_path, state)
+    _run(cfg, capsys, role="fallback")  # a day later: checks again
+    assert "posts-member" in FakeYouTube.calls
 
 
 def test_public_page_failure_holds_unbadged_member_posts(tmp_path, capsys):
@@ -574,3 +582,40 @@ def test_streak_resets_on_non_failure_status(wired, tmp_path, capsys):
     FakeYouTube.member_fails, FakeYouTube.member_logged_in = False, False
     notifier.run(wired, role="primary")
     assert _state(tmp_path)["runners"]["primary"]["member_fail_streak"] == 0
+
+
+def test_fallback_takeover_alerts_the_state_channel_once(wired, tmp_path, capsys):
+    notifier.run(wired, role="primary")  # primary ran once
+    state = _state(tmp_path)
+    old = "2000-01-01T00:00:00+00:00"
+    state["runners"]["primary"].update({"last_success": old, "last_run": old})
+    _write_state(tmp_path, state)
+    for _ in range(2):
+        notifier.run(wired, role="fallback")
+    alerts = [p for d in FakeDiscordClient.instances for c, p in d.sent if c == "999"]
+    assert len(alerts) == 1 and "主系の PC が止まっています" in alerts[0]["content"]
+
+
+def test_no_takeover_alert_when_no_primary_ever_ran(wired, tmp_path, capsys):
+    notifier.run(wired, role="fallback")
+    assert not [p for d in FakeDiscordClient.instances for c, p in d.sent if c == "999"]
+
+
+def test_unexpected_errors_reach_the_log_file_without_a_console(tmp_path, monkeypatch):
+    import sys
+    from achichi_notifier import __main__ as cli
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("parser exploded")
+
+    monkeypatch.setattr(notifier, "run", boom)
+    monkeypatch.setattr(sys, "stderr", None)
+    log_path = tmp_path / "notifier.log"
+    env = tmp_path / ".env"
+    env.write_text("DISCORD_CHANNEL_ID=1\nSTATE_BACKEND=file\n", encoding="utf-8")
+    rc = cli.main(["--env-file", str(env), "--log-file", str(log_path), "run"])
+    monkeypatch.undo()
+    cli._setup_logging(False, None)
+    assert rc == 1
+    text = log_path.read_text(encoding="utf-8")
+    assert "unexpected error" in text and "Traceback" in text and "parser exploded" in text

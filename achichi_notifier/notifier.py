@@ -356,15 +356,19 @@ def _primary_is_fresh(state: State, cfg: Config, now: datetime) -> bool:
     return _fresh(state.runners.get("primary", {}).get("last_success"), now, cfg.fallback_after_minutes)
 
 
+MEMBER_SELF_CHECK_HOURS = 24
+
+
 def _member_check_due(state: State, cfg: Config, yt: YouTubeClient, now: datetime) -> bool:
     """Fallback-only: members-only checks run on their own schedule while the primary is
-    healthy, unless the primary already has working member cookies."""
+    healthy. If the primary already has working member cookies, the fallback still checks
+    once a day so its own (spare) cookies are known to work."""
     if not yt.cookies_configured:
         return False
+    last = state.runners.get("fallback", {}).get("last_member_check")
     primary = state.runners.get("primary", {})
     if _fresh(primary.get("last_member_success"), now, cfg.fallback_after_minutes):
-        return False
-    last = state.runners.get("fallback", {}).get("last_member_check")
+        return not _fresh(last, now, MEMBER_SELF_CHECK_HOURS * 60)
     return not _fresh(last, now, cfg.member_check_minutes)
 
 
@@ -375,7 +379,7 @@ def _in_github() -> bool:
 def _runner_label(role: str) -> str:
     if _in_github():
         return "GitHub Actions"
-    return "Mac（予備系）" if role == "fallback" else "この PC"
+    return "Mac（予備系）" if role == "fallback" else "主系の PC"
 
 
 COOKIE_PROBLEMS = {
@@ -390,13 +394,18 @@ COOKIE_PROBLEMS = {
 
 def _cookie_fix(role: str, status: str) -> str:
     if status == "fetch_failed":
-        return ("しばらく様子を見て、続くようなら `uv run python -m achichi_notifier check` "
-                "で状態を確認してください。")
+        return ("しばらく様子を見て、続くようなら、この PC にインストールしたアプリで check を実行してください"
+                "（Windows: `& \"$env:LOCALAPPDATA\\achichi-notifier\\venv\\Scripts\\python.exe\" -m achichi_notifier "
+                "--env-file \"$env:LOCALAPPDATA\\achichi-notifier\\.env\" check`、Mac: "
+                "`cd ~/Library/Application\\ Support/achichi-notifier && ./venv/bin/python -m achichi_notifier check`）。")
     if _in_github():
-        return ("GitHub の Secret `YOUTUBE_COOKIES_B64` を更新するか、"
-                "Cookie を GitHub で使わないなら `gh secret delete YOUTUBE_COOKIES_B64` で削除してください。")
-    return ("Cookie を書き出し直して `~/Documents/DiscordBot_achichi/cookies.txt` に置き、"
-            "`./deploy/mac/install.sh` を再実行してください。")
+        return ("Cookie はクラウドに置かない運用です。GitHub の Secret `YOUTUBE_COOKIES_B64` を "
+                "`gh secret delete YOUTUBE_COOKIES_B64` で削除してください。")
+    if role == "fallback":
+        return ("Cookie を書き出し直して `~/Documents/DiscordBot_achichi/cookies.txt` に置き、"
+                "`./deploy/mac/install.sh` を再実行してください。")
+    return ("Cookie を書き出し直して、この PC のリポジトリフォルダに `cookies.txt` として置き、"
+            "インストールをやり直してください（Windows: `deploy\\windows\\install.ps1`、Mac: `./deploy/mac/install.sh`）。")
 
 
 def _cookie_alert(cfg: Config, discord: DiscordClient | None, state: State, role: str,
@@ -421,6 +430,36 @@ def _cookie_alert(cfg: Config, discord: DiscordClient | None, state: State, role
         state.alerts[key] = now_iso()
     except DiscordError as exc:
         log.warning("could not send cookie alert: %s", exc)
+
+
+PRIMARY_DOWN_ALERT_INTERVAL = timedelta(hours=12)
+
+
+def _primary_down_alert(cfg: Config, discord: DiscordClient | None, state: State,
+                        now: datetime, dry_run: bool) -> None:
+    """Fallback took over: say so in the private state channel (at most every 12h)."""
+    primary = state.runners.get("primary", {})
+    last_success, last_run = parse_time(primary.get("last_success")), parse_time(primary.get("last_run"))
+    if last_success is None and last_run is None:
+        return  # no primary has ever run (e.g. Mac-only setup)
+    if dry_run or discord is None or cfg.state_backend != "discord" or not cfg.state_channel_id:
+        return
+    if _fresh(state.alerts.get("primary_down"), now, PRIMARY_DOWN_ALERT_INTERVAL.total_seconds() / 60):
+        return
+    since = f"<t:{int((last_success or last_run).timestamp())}:R>"
+    if last_run and now - last_run < timedelta(minutes=cfg.fallback_after_minutes):
+        cause = ("主系の PC は動いていますが、確認が失敗し続けています。"
+                 "主系の PC の `notifier.log` を確認してください。")
+    else:
+        cause = ("主系の PC が動いていません。電源・スリープ・サインアウト・"
+                 "再起動後の未サインインなどを確認してください。")
+    message = (f"⚠️ **主系の PC が止まっています**（最終成功 {since}）。いまは Mac（予備系）が代わりに確認しています。\n"
+               + cause)
+    try:
+        discord.send(cfg.state_channel_id, {"content": message, "allowed_mentions": {"parse": []}})
+        state.alerts["primary_down"] = now_iso()
+    except DiscordError as exc:
+        log.warning("could not send the primary-down alert: %s", exc)
 
 
 class _RecentlyPosted:
@@ -469,6 +508,8 @@ def run(cfg: Config, role: str = "primary", dry_run: bool = False) -> int:
         log.warning("source error: %s", error)
 
     state.owner_role = role
+    if role == "fallback" and mode == "full":
+        _primary_down_alert(cfg, discord, state, now, dry_run)
     runner = state.runners.setdefault(role, {})
     if result.member_status is not None:
         runner["last_member_check"] = now_iso()
