@@ -334,11 +334,15 @@ def test_sigterm_to_the_refresh_job_still_stops_the_browser(tmp_path):
                     "time.sleep(120)\n")
     fake.chmod(0o755)
     # refresh-browser is a no-op on Linux (only Windows and macOS have the daily task), but the
-    # code past that gate is the same POSIX path on both, so Linux CI runs it as macOS.
+    # code past that gate is the same POSIX path on both, so on Linux CI the CLI alone is told it
+    # runs on macOS. (Setting sys.platform itself breaks imports such as urllib's _scproxy.)
     runner = (
         "import sys, logging; from pathlib import Path\n"
-        "sys.platform = 'darwin'\n"
         "from achichi_notifier import __main__ as cli\n"
+        "class MacSys:\n"
+        "    platform = 'darwin'\n"
+        "    def __getattr__(self, name): return getattr(sys, name)\n"
+        "cli.sys = MacSys()\n"
         "class C: firefox_profile = Path(sys.argv[1]); firefox_exe = Path(sys.argv[2]); refresh_seconds = 100\n"
         "sys.exit(cli._refresh_browser(C, None, 'about:blank'))\n")
     job = subprocess.Popen([sys.executable, "-c", runner, str(prof), str(fake)])
