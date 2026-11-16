@@ -15,7 +15,7 @@ from functools import lru_cache
 from . import destinations as dests
 from . import render
 from .config import Config, ConfigError
-from .discord_api import SUPPRESS_NOTIFICATIONS, DiscordClient, DiscordError
+from .discord_api import DiscordClient, DiscordError, mark_preview
 from .state import BACKLOG_PREFIX, DiscordStateStore, FileStateStore, State, now_iso, parse_time
 from .youtube import (
     VIDEO_TABS, ChannelMeta, Post, PostsPage, VideoInfo, VideoRef, YouTubeClient, YouTubeError,
@@ -25,7 +25,7 @@ from .youtube import (
 log = logging.getLogger(__name__)
 
 ROLES = ("primary", "fallback")
-FEATURES = ("destinations",)
+FEATURES = ("destinations", "preview_mark")
 COOKIE_ALERT_INTERVAL = timedelta(hours=24)
 # Consecutive failed members-only checks before the state channel is told (~30 min on the
 # Windows primary, ~1h on the Mac). Covers temporary page problems and Firefox-profile reads
@@ -870,7 +870,18 @@ def run(cfg: Config, role: str = "primary", dry_run: bool = False) -> int:
     return 1 if send_failures else 0
 
 
-def preview(cfg: Config, send: bool = False, dest_name: str = dests.MAIN) -> int:
+def outdated_runners(state: State, feature: str, now: datetime | None = None) -> list[str]:
+    """Roles that ran in the last 24 hours on a version without this feature."""
+    now = now or datetime.now(timezone.utc)
+    old = []
+    for role, runner in sorted(state.runners.items()):
+        last = parse_time(runner.get("last_run"))
+        if last and now - last < timedelta(hours=24) and feature not in (runner.get("features") or []):
+            old.append(role)
+    return old
+
+
+def preview(cfg: Config, send: bool = False, dest_name: str = dests.MAIN, force: bool = False) -> int:
     """Render the latest item of each type regardless of state (to check formatting)."""
     yt = YouTubeClient.from_config(cfg)
     notifier = Notifier(cfg, yt)
@@ -923,18 +934,28 @@ def preview(cfg: Config, send: bool = False, dest_name: str = dests.MAIN) -> int
     if send:
         cfg.require_discord()
         discord = DiscordClient(cfg.discord_token)
-        targets = [d for d in dests.resolve(cfg, make_store(cfg, discord).load()) if d.name == dest_name.lower()]
+        state = make_store(cfg, discord).load()
+        targets = [d for d in dests.resolve(cfg, state) if d.name == dest_name.lower()]
         if not targets:
             raise ConfigError(f"unknown destination: {dest_name}")
+        old = outdated_runners(state, "preview_mark")
+        if old and not force:
+            # An older runner's "already posted?" check would take the preview for the real
+            # notification and skip it for good (e.g. a members-only post awaiting confirmation).
+            print(f"⚠️  [!!] {', '.join(old)} の PC が古い版のため、プレビューを送りませんでした。"
+                  "古い版はプレビューを本物の通知と見分けられず、本物の通知を送らなくなることがあります。"
+                  "Windows は git pull → install.ps1、Mac は ./deploy/mac/install.sh で更新してから、"
+                  "もう一度実行してください（それでも送るときは --force）。")
+            return 2
         dest = targets[0]
         for note in notes:
             channel = dest.channel_for(note.kind)
             if not channel or not dest.wants(note.kind):
                 continue
             payload = render.apply_mention(note.payload, None)  # previews never ping anyone
-            # Looks exactly like the real notification, but silent; the flag also keeps the
-            # "already posted?" check from mistaking a preview for the real thing.
-            payload["flags"] = SUPPRESS_NOTIFICATIONS
+            # Sent exactly like the real notification (sound and push included); an invisible
+            # mark keeps the "already posted?" check from mistaking it for the real thing.
+            payload["content"] = mark_preview(payload["content"])
             discord.send(channel, payload)
             log.info("sent preview %s to %s", note.kind, dest.name)
     else:

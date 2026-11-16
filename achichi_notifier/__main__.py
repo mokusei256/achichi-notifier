@@ -253,6 +253,8 @@ def main(argv: list[str] | None = None) -> int:
                                             "or live only, EXCLUDE_LIVE_TITLES skipped)")
     p_prev.add_argument("--send", action="store_true", help="actually post the previews")
     p_prev.add_argument("--dest", default="main", help="destination to preview for (default: main)")
+    p_prev.add_argument("--force", action="store_true",
+                        help="send even while a runner is on an older version (it may then skip the real notification)")
 
     sub.add_parser("check", help="gateway login + permission and YouTube checks")
 
@@ -304,7 +306,7 @@ def main(argv: list[str] | None = None) -> int:
             return run(cfg, role=args.role, dry_run=args.dry_run)
         if args.command == "preview":
             from .notifier import preview
-            return preview(cfg, send=args.send, dest_name=args.dest)
+            return preview(cfg, send=args.send, dest_name=args.dest, force=args.force)
         if args.command == "refresh-browser":
             return _refresh_browser(cfg, args.dwell, args.url)
         if args.command == "dest":

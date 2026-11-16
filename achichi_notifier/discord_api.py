@@ -14,10 +14,22 @@ from . import __version__
 log = logging.getLogger(__name__)
 
 API = "https://discord.com/api/v10"
-# Message flag: posted without a push / desktop notification ("@silent"). Previews use it, and
-# it is how recent_urls() tells them from real notifications.
-SUPPRESS_NOTIFICATIONS = 1 << 12
-LEGACY_PREVIEW_PREFIX = "【プレビュー】"  # previews sent by older versions
+# Previews are sent like real notifications (sound and push included) and end with this
+# invisible character, which is how recent_urls() tells them from the real thing.
+PREVIEW_MARK = "\u200b"  # zero-width space
+# Earlier versions marked previews differently; those messages still count as previews.
+SUPPRESS_NOTIFICATIONS = 1 << 12  # "@silent" flag (previews of the previous version)
+LEGACY_PREVIEW_PREFIX = "【プレビュー】"  # previews of older versions
+
+
+def mark_preview(content: str) -> str:
+    return content + PREVIEW_MARK
+
+
+def is_preview(message: dict) -> bool:
+    content = message.get("content") or ""
+    return (content.endswith(PREVIEW_MARK) or content.startswith(LEGACY_PREVIEW_PREFIX)
+            or bool(int(message.get("flags") or 0) & SUPPRESS_NOTIFICATIONS))
 
 
 class DiscordError(Exception):
@@ -89,16 +101,13 @@ class DiscordClient:
 
     def recent_urls(self, channel_id: str, limit: int = 50) -> set[str]:
         """Embed links of this bot's own recent notifications in the channel. Links posted
-        by people or other bots, and the bot's previews (silent messages, or 【プレビュー】
-        from older versions), are ignored."""
+        by people or other bots, and the bot's previews (see is_preview), are ignored."""
         bot_id = self.me()["id"]
         urls: set[str] = set()
         for message in self.messages(channel_id, limit=limit):
             if message.get("author", {}).get("id") != bot_id:
                 continue
-            if int(message.get("flags") or 0) & SUPPRESS_NOTIFICATIONS:
-                continue
-            if (message.get("content") or "").startswith(LEGACY_PREVIEW_PREFIX):
+            if is_preview(message):
                 continue
             for embed in message.get("embeds") or []:
                 if embed.get("url"):

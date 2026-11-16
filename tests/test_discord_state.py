@@ -93,6 +93,8 @@ def test_recent_urls_only_counts_this_bots_real_notifications():
                  "embeds": [{"url": "https://www.youtube.com/watch?v=PREVIEW0001"}]},
                 {"author": {"id": "bot"}, "content": "📅 配信枠が作成されました", "flags": 4096,
                  "embeds": [{"url": "https://www.youtube.com/watch?v=PREVIEW0002"}]},
+                {"author": {"id": "bot"}, "content": "📅 配信枠が作成されました\u200b",
+                 "embeds": [{"url": "https://www.youtube.com/watch?v=PREVIEW0003"}]},
                 {"author": {"id": "bot"}, "content": "📅 配信枠が作成されました",
                  "embeds": [{"url": "https://www.youtube.com/watch?v=REALNOTE001"}]},
             ]

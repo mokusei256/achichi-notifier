@@ -4,7 +4,8 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from achichi_notifier import notifier
+from achichi_notifier import notifier, render
+from achichi_notifier.discord_api import is_preview
 from achichi_notifier.config import DEFAULT_EXCLUDE_LIVE_TITLES, Config, ConfigError
 from dataclasses import replace
 
@@ -896,7 +897,7 @@ def test_pattern_matching_every_title_is_rejected(monkeypatch, raw):
         Config.from_env()
 
 
-def test_sent_previews_look_real_but_are_silent(tmp_path, monkeypatch):
+def test_sent_previews_are_normal_messages_with_an_invisible_mark(tmp_path, monkeypatch):
     sent = []
 
     class Discord:
@@ -913,7 +914,69 @@ def test_sent_previews_look_real_but_are_silent(tmp_path, monkeypatch):
                           *FakeYouTube.videos]
     cfg = _cfg(tmp_path, discord_token="token")
     assert notifier.preview(cfg, send=True) == 0
-    assert sent and all(p["flags"] & notifier.SUPPRESS_NOTIFICATIONS for p in sent)
+    assert sent and all("flags" not in p for p in sent)  # not silent: sound and push like the real thing
     assert all("プレビュー" not in p["content"] for p in sent)
     assert all(p["allowed_mentions"] == {"parse": []} for p in sent)
-    assert any(p["content"] == "📅 配信枠が作成されました" for p in sent)
+    assert any(p["content"] == "📅 配信枠が作成されました\u200b" for p in sent)
+    assert all(is_preview({"content": p["content"]}) for p in sent)
+
+
+def _ago(hours):
+    return (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat(timespec="seconds")
+
+
+def _send_preview_with_runners(tmp_path, monkeypatch, runners, **kwargs):
+    sent = []
+
+    class Discord:
+        def __init__(self, token):
+            pass
+
+        def send(self, channel, payload):
+            sent.append(payload)
+            return {}
+
+    monkeypatch.setattr(notifier, "DiscordClient", Discord)
+    monkeypatch.setattr(notifier, "make_store", lambda cfg, discord: FileStateStore(cfg.state_file))
+    cfg = _cfg(tmp_path, discord_token="token")
+    store = FileStateStore(cfg.state_file)
+    state = store.load()
+    state.runners = runners
+    store.save(state)
+    return notifier.preview(cfg, send=True, **kwargs), sent
+
+
+NEW = list(notifier.FEATURES)
+
+
+@pytest.mark.parametrize("runners, allowed", [
+    ({}, True),
+    ({"primary": {"last_run": _ago(0.1), "features": NEW}}, True),
+    ({"primary": {"last_run": _ago(0.1), "features": NEW}, "fallback": {"last_run": _ago(5), "features": NEW}}, True),
+    ({"primary": {"last_run": _ago(0.1), "features": ["destinations"]}}, False),
+    ({"primary": {"last_run": _ago(0.1), "features": NEW}, "fallback": {"last_run": _ago(5), "features": ["destinations"]}}, False),
+    ({"primary": {"last_run": _ago(0.1)}}, False),  # from before runners recorded their features
+    ({"primary": {"last_run": _ago(0.1), "features": NEW}, "fallback": {"last_run": _ago(30), "features": ["destinations"]}}, True),
+], ids=["no-runners", "primary-new", "both-new", "primary-old", "fallback-old", "no-features", "old-but-idle-a-day"])
+def test_preview_waits_until_no_old_runner_could_take_it_for_the_real_notification(
+        tmp_path, monkeypatch, capsys, runners, allowed):
+    code, sent = _send_preview_with_runners(tmp_path, monkeypatch, runners)
+    if allowed:
+        assert code == 0 and sent
+    else:
+        assert code == 2 and not sent
+        assert "古い版" in capsys.readouterr().out
+
+
+def test_force_sends_the_preview_despite_an_old_runner(tmp_path, monkeypatch):
+    code, sent = _send_preview_with_runners(
+        tmp_path, monkeypatch, {"primary": {"last_run": _ago(0.1), "features": ["destinations"]}}, force=True)
+    assert code == 0 and sent
+
+
+@pytest.mark.parametrize("kind", sorted(render.HEADLINES))
+@pytest.mark.parametrize("mention", [None, "<@&123>", "@everyone"])
+def test_a_real_notification_is_never_taken_for_a_preview(kind, mention):
+    message = {"content": render.apply_mention({"content": render._content(kind, None)}, mention)["content"],
+               "flags": 0}
+    assert not is_preview(message)

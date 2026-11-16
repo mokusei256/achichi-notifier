@@ -75,7 +75,7 @@ Bot として一度ゲートウェイにログインし、権限と YouTube へ�
 uv run python -m achichi_notifier check
 ```
 
-最新の動画・ショート・投稿を 1 件ずつ、通知と同じ見た目で出力します。配信は、立っている枠か配信中のものがあるときだけ出します（アーカイブと、`EXCLUDE_LIVE_TITLES` に当てはまるフリーチャットなどの枠は出しません）。`--send` を付けると実際にチャンネルへ投稿します。投稿したプレビューは本物の通知と同じ見た目ですが、誰にもメンションせず、通知音やスマホへのプッシュ通知も鳴らない「サイレント」メッセージになります。
+最新の動画・ショート・投稿を 1 件ずつ、通知と同じ見た目で出力します。配信は、立っている枠か配信中のものがあるときだけ出します（アーカイブと、`EXCLUDE_LIVE_TITLES` に当てはまるフリーチャットなどの枠は出しません）。`--send` を付けると実際にチャンネルへ投稿します。投稿したプレビューは本物の通知と同じ見た目で、通知音やスマホへのプッシュ通知も普通に鳴ります（誰にもメンションはしません）。文末に見えない目印（ゼロ幅スペース）が付いていて、Bot はこれで本物の通知と区別します。古い版の Bot が動いている間は区別できないため、送らずに更新を促します（Windows と Mac の両方を更新してから使ってください）。
 
 ```bash
 uv run python -m achichi_notifier preview
@@ -390,7 +390,7 @@ uv run python -m achichi_notifier dest list                       # 一覧
 uv run python -m achichi_notifier dest check bigserver --send-test # 権限の確認とテスト送信
 uv run python -m achichi_notifier dest disable bigserver          # 一時停止（enable で再開）
 uv run python -m achichi_notifier dest remove bigserver           # 削除
-uv run python -m achichi_notifier preview --send --dest bigserver # 見た目の確認（メンション・プッシュ通知なし）
+uv run python -m achichi_notifier preview --send --dest bigserver # 見た目の確認（メンションなし。通知音・プッシュ通知は鳴ります）
 ```
 
 - 1 つの送り先に送れなくても、ほかの送り先には届きます（#管理 に「送り先「〇〇」に通知を送れませんでした」と届きます）。
@@ -407,7 +407,7 @@ uv run python -m achichi_notifier preview --send --dest bigserver # 見た目の
 | `run --role primary` | 1 回確認して新着を投稿（主系の PC 用） |
 | `run --role fallback` | 主系が `FALLBACK_AFTER_MINUTES` 以上止まっているときは全体を確認。Cookie があれば `MEMBER_CHECK_MINUTES` ごとにメン限投稿を確認（Mac 用） |
 | `run --dry-run --state-file /tmp/achichi-test-state.json` | 投稿せずに表示するだけ。状態はリポジトリの外の一時ファイルに保存し、Discord の状態には触れない |
-| `preview [--send]` | 種類ごとの最新 1 件を通知の見た目で表示／送信（配信は立っている枠・配信中のみ、フリーチャットなどは除く。送信はサイレント） |
+| `preview [--send]` | 種類ごとの最新 1 件を通知の見た目で表示／送信（配信は立っている枠・配信中のみ、フリーチャットなどは除く。メンションなしで送信。古い版の Bot が動いている間は送らない） |
 | `check` | ゲートウェイログイン・権限（追加した送り先も含む）・YouTube・Cookie を確認 |
 | `dest list/add/remove/enable/disable/check` | 通知の送り先を管理（[上記](#別のサーバーにも通知する送り先の追加)） |
 
