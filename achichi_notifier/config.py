@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import binascii
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -13,6 +14,12 @@ DEFAULT_YOUTUBE_HANDLE = "@AchichiMela"
 
 # Destination groups. Each can be routed to its own Discord channel / mention.
 KINDS = ("video", "short", "live", "post")
+
+# Stream slots whose title matches are never announced: a free chat room is a placeholder
+# "upcoming stream" that never starts. Titles are NFKC-normalised before matching, so
+# half-width katakana and full-width letters are covered; matching ignores case.
+DEFAULT_EXCLUDE_LIVE_TITLES = r"フリーチャット|フリチャ|ふりーちゃっと|free[\s_-]*chat"
+EXCLUDE_OFF = ("none", "off")
 
 
 class ConfigError(Exception):
@@ -111,6 +118,7 @@ class Config:
     firefox_profile: Path | None = None
     firefox_exe: Path | None = None
     refresh_seconds: int = 150
+    exclude_live_titles: str | None = DEFAULT_EXCLUDE_LIVE_TITLES  # regex; None = announce all
 
     @classmethod
     def from_env(cls) -> Config:
@@ -134,6 +142,17 @@ class Config:
 
         cookies_file = _env("YOUTUBE_COOKIES_FILE")
 
+        exclude = _env("EXCLUDE_LIVE_TITLES", DEFAULT_EXCLUDE_LIVE_TITLES)
+        if exclude.lower() in EXCLUDE_OFF:
+            exclude = None
+        else:
+            try:
+                compiled = re.compile(exclude)
+            except re.error as exc:
+                raise ConfigError(f"EXCLUDE_LIVE_TITLES is not a valid regular expression ({exc})") from exc
+            if compiled.search(""):  # e.g. a stray "|" at the end: every stream would be dropped
+                raise ConfigError("EXCLUDE_LIVE_TITLES matches an empty title, so it would hide every stream")
+
         return cls(
             discord_token=_env("DISCORD_BOT_TOKEN"),
             channel_ids=channel_ids,
@@ -152,6 +171,7 @@ class Config:
             firefox_profile=_env_path("YOUTUBE_FIREFOX_PROFILE"),
             firefox_exe=_env_path("FIREFOX_EXE"),
             refresh_seconds=_env_number("FIREFOX_REFRESH_SECONDS", 150),
+            exclude_live_titles=exclude,
         )
 
     @property

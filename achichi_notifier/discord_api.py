@@ -14,6 +14,10 @@ from . import __version__
 log = logging.getLogger(__name__)
 
 API = "https://discord.com/api/v10"
+# Message flag: posted without a push / desktop notification ("@silent"). Previews use it, and
+# it is how recent_urls() tells them from real notifications.
+SUPPRESS_NOTIFICATIONS = 1 << 12
+LEGACY_PREVIEW_PREFIX = "【プレビュー】"  # previews sent by older versions
 
 
 class DiscordError(Exception):
@@ -85,13 +89,16 @@ class DiscordClient:
 
     def recent_urls(self, channel_id: str, limit: int = 50) -> set[str]:
         """Embed links of this bot's own recent notifications in the channel. Links posted
-        by people or other bots, and the bot's 【プレビュー】 messages, are ignored."""
+        by people or other bots, and the bot's previews (silent messages, or 【プレビュー】
+        from older versions), are ignored."""
         bot_id = self.me()["id"]
         urls: set[str] = set()
         for message in self.messages(channel_id, limit=limit):
             if message.get("author", {}).get("id") != bot_id:
                 continue
-            if (message.get("content") or "").startswith("【プレビュー】"):
+            if int(message.get("flags") or 0) & SUPPRESS_NOTIFICATIONS:
+                continue
+            if (message.get("content") or "").startswith(LEGACY_PREVIEW_PREFIX):
                 continue
             for embed in message.get("embeds") or []:
                 if embed.get("url"):

@@ -1,6 +1,6 @@
 #!/bin/bash
-# Stop and remove the launchd agent. The app directory (venv, .env, cookies, log) is kept
-# unless PURGE=1 is given.
+# Stop and remove the launchd agents (and the bot Firefox login app). The app directory
+# (venv, .env, cookies, bot Firefox profile, logs) is kept unless PURGE=1 is given.
 #
 #   ./deploy/mac/uninstall.sh            # remove the launchd job only
 #   PURGE=1 ./deploy/mac/uninstall.sh    # also delete the app directory (incl. cookies.txt)
@@ -8,6 +8,9 @@ set -euo pipefail
 REPO="$(cd "$(dirname "$0")/../.." && pwd)"
 LABEL="com.achichi.notifier"
 PLIST="${PLIST:-$HOME/Library/LaunchAgents/$LABEL.plist}"
+BROWSER_LABEL="com.achichi.notifier.browser"
+BROWSER_PLIST="${BROWSER_PLIST:-$HOME/Library/LaunchAgents/$BROWSER_LABEL.plist}"
+LOGIN_APP="${LOGIN_APP:-$HOME/Applications/achichi-notifier YouTube login.app}"
 APP_DIR="${APP_DIR:-$HOME/Library/Application Support/achichi-notifier}"
 
 if [ "${PURGE:-0}" = "1" ]; then
@@ -18,14 +21,16 @@ if [ "${PURGE:-0}" = "1" ]; then
 fi
 
 launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
-rm -f "$PLIST"
+launchctl bootout "gui/$(id -u)/$BROWSER_LABEL" 2>/dev/null || true
+rm -f "$PLIST" "$BROWSER_PLIST"
+rm -rf "$LOGIN_APP"
 echo "✅ launchd から削除しました"
 
 if [ "${PURGE:-0}" = "1" ]; then
   rm -rf "$APP_DIR"
-  echo "✅ アプリ本体を削除しました（Cookie のコピーを含む）: $APP_DIR"
+  echo "✅ アプリ本体を削除しました（Cookie のコピーと Bot 用 Firefox プロファイルを含む）: $APP_DIR"
 elif [ -d "$APP_DIR" ]; then
-  echo "   アプリ本体（venv・.env・Cookie・ログ）は残しています: $APP_DIR"
+  echo "   アプリ本体（venv・.env・Cookie・Bot 用 Firefox プロファイル・ログ）は残しています: $APP_DIR"
   if [ -f "$APP_DIR/cookies.txt" ]; then
     echo "   Cookie のコピーだけ消す:   rm \"$APP_DIR/cookies.txt\""
   fi

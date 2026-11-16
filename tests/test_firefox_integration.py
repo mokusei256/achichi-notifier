@@ -76,6 +76,7 @@ def test_read_failures_alert_only_after_a_streak_with_login_steps(monkeypatch, w
 
 
 def test_firefox_format_problem_alerts_immediately(monkeypatch, wired_ff, tmp_path):
+    monkeypatch.setattr(notifier, "PLATFORM", "win32")
     monkeypatch.setattr(FakeYouTube, "cookie_error", "Firefox profile: not a plain SQLite file")
     monkeypatch.setattr(FakeYouTube, "cookie_transient", False, raising=False)
     monkeypatch.setattr(FakeYouTube, "cookie_source", "firefox", raising=False)
@@ -95,15 +96,28 @@ def test_browser_refresh_failures_alert_once_a_day(wired_ff, tmp_path, failures,
         assert "exited-early:1" in refresh_alerts[0]
 
 
-def test_fallback_never_reads_the_browser_refresh_status(wired_ff, tmp_path):
+def test_fallback_reports_its_own_browser_refresh_under_its_own_key(monkeypatch, wired_ff, tmp_path):
+    """The Mac fallback has its own bot profile and daily refresh; its alert names the Mac and
+    never uses up the primary's throttle (or the other way round)."""
+    monkeypatch.setattr(notifier, "PLATFORM", "darwin")
     status_file = wired_ff.firefox_profile.parent / "browser-refresh.json"
-    status_file.write_text(json.dumps({"consecutive_failures": 9}))
+    status_file.write_text(json.dumps({"consecutive_failures": 9, "last_result": "exited-early:1",
+                                       "last_attempt": "2026-11-16T05:30:00+00:00"}))
     notifier.run(wired_ff, role="fallback")
-    assert not [a for a in _alerts() if "自動更新" in a]
+    alerts = [a for a in _alerts() if "自動更新" in a]
+    assert len(alerts) == 1 and "Mac（予備系）" in alerts[0] and "launchctl kickstart" in alerts[0]
+    assert "Start-ScheduledTask" not in alerts[0]
+    state = json.loads((tmp_path / "state.json").read_text())
+    assert "browser_refresh:fallback" in state["alerts"] and "browser_refresh" not in state["alerts"]
 
 
 def test_cookie_fix_text_depends_on_the_source():
-    assert "achichi-notifier YouTube login" in notifier._cookie_fix("primary", "logged_out", "firefox")
-    assert "install.ps1 -FirefoxProfile" in notifier._cookie_fix("primary", "unreadable", "firefox")
+    win = notifier._cookie_fix("primary", "logged_out", "firefox", platform="win32")
+    mac = notifier._cookie_fix("fallback", "logged_out", "firefox", platform="darwin")
+    assert "achichi-notifier YouTube login" in win and "スタートメニュー" in win
+    assert "achichi-notifier YouTube login" in mac and "~/Applications" in mac and "スタートメニュー" not in mac
+    assert "install.ps1 -FirefoxProfile" in notifier._cookie_fix("primary", "unreadable", "firefox", platform="win32")
+    mac_fix = notifier._cookie_fix("fallback", "unreadable", "firefox", platform="darwin")
+    assert "install.sh" in mac_fix and "install.ps1" not in mac_fix
     assert "install.sh" in notifier._cookie_fix("fallback", "logged_out", "file")
     assert notifier._cookie_fix("fallback", "logged_out", None) == notifier._cookie_fix("fallback", "logged_out")

@@ -5,16 +5,20 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
+import sys
+import unicodedata
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
+from functools import lru_cache
 
 from . import destinations as dests
 from . import render
 from .config import Config, ConfigError
-from .discord_api import DiscordClient, DiscordError
+from .discord_api import SUPPRESS_NOTIFICATIONS, DiscordClient, DiscordError
 from .state import BACKLOG_PREFIX, DiscordStateStore, FileStateStore, State, now_iso, parse_time
 from .youtube import (
-    VIDEO_TABS, ChannelMeta, Post, PostsPage, VideoRef, YouTubeClient, YouTubeError,
+    VIDEO_TABS, ChannelMeta, Post, PostsPage, VideoInfo, VideoRef, YouTubeClient, YouTubeError,
     approx_age_hours,
 )
 
@@ -128,6 +132,23 @@ def classify_member_posts(member_page: PostsPage,
     return badge, by_comparison
 
 
+@lru_cache(maxsize=8)
+def _title_pattern(pattern: str) -> re.Pattern:
+    return re.compile(pattern, re.IGNORECASE)
+
+
+def excluded_stream(cfg: Config, kind: str, title: str | None) -> bool:
+    """True for a stream (slot) whose title matches EXCLUDE_LIVE_TITLES, e.g. a free chat
+    room. Only stream kinds are filtered: a video that merely mentions "free chat" still counts.
+    The title is tried as-is (so text pasted from a title keeps matching) and NFKC-normalised
+    (so an ASCII / full-width-kana pattern also covers half-width kana and full-width letters).
+    The pattern itself is never normalised: that would turn （）［］？ into regex syntax."""
+    if not cfg.exclude_live_titles or not title or render.GROUPS.get(kind) != "live":
+        return False
+    pattern = _title_pattern(cfg.exclude_live_titles)
+    return bool(pattern.search(title) or pattern.search(unicodedata.normalize("NFKC", title)))
+
+
 def _merge_refs(groups: list[list[VideoRef]]) -> list[VideoRef]:
     merged: dict[str, VideoRef] = {}
     for refs in groups:
@@ -190,6 +211,11 @@ class Notifier:
             new = new[: self.cfg.max_new_per_run]
         for ref in new:
             info = self.yt.fetch_video_info(ref)
+            if excluded_stream(self.cfg, info.kind, info.title):
+                log.info("stream %s is excluded by EXCLUDE_LIVE_TITLES (%s); marking seen without notifying",
+                         ref.video_id, info.title)
+                state.videos[ref.video_id] = now_iso()
+                continue
             if info.published and self.now - info.published > self.max_age:
                 log.info("video %s is old (%s); marking seen without notifying",
                          ref.video_id, info.published.date())
@@ -408,13 +434,24 @@ COOKIE_PROBLEMS = {
     "read_failed": "Bot 用 Firefox プロファイルから YouTube のログイン Cookie を {streak} 回続けて取得できません（{detail}）。",
 }
 
-FIREFOX_LOGIN_FIX = ("主系の PC でスタートメニューの「achichi-notifier YouTube login」を開き、通常ウィンドウのまま"
-                     "メンバー加入済みのアカウントで YouTube にログインしてください。パスワードは保存せず、"
-                     "ログアウトせずにメニューから Firefox を終了します。次の確認（5 分以内）で自動的に戻ります。"
-                     "何も表示されないときは 3 分待ってもう一度（毎日の自動更新中の可能性）。")
+PLATFORM = sys.platform  # the runner sending an alert is the one to fix (tests override this)
 
 
-def _cookie_fix(role: str, status: str, source: str | None = None) -> str:
+def _login_launcher(platform: str) -> str:
+    """Where the runner's installer put the 'open the bot Firefox profile' launcher."""
+    if platform == "darwin":
+        return "Mac のホームの「アプリケーション」（~/Applications）にある「achichi-notifier YouTube login」"
+    return "Windows のスタートメニューの「achichi-notifier YouTube login」"
+
+
+def _firefox_login_fix(platform: str) -> str:
+    return (f"{_login_launcher(platform)}を開き、通常ウィンドウのままメンバー加入済みのアカウントで YouTube に"
+            "ログインしてください。パスワードは保存せず、ログアウトせずにメニューから Firefox を終了します。"
+            "次の確認（数分以内）で自動的に戻ります。何も表示されないときは 3 分待ってもう一度（毎日の自動更新中の可能性）。")
+
+
+def _cookie_fix(role: str, status: str, source: str | None = None, platform: str | None = None) -> str:
+    platform = platform or PLATFORM
     if status == "fetch_failed":
         return ("しばらく様子を見て、続くようなら、この PC にインストールしたアプリで check を実行してください"
                 "（Windows: `& \"$env:LOCALAPPDATA\\achichi-notifier\\venv\\Scripts\\python.exe\" -m achichi_notifier "
@@ -422,13 +459,16 @@ def _cookie_fix(role: str, status: str, source: str | None = None) -> str:
                 "`cd ~/Library/Application\\ Support/achichi-notifier && ./venv/bin/python -m achichi_notifier check`）。")
     if source == "firefox":
         if status == "unreadable":
+            if platform == "darwin":
+                return ("Mac で `git pull` → `./deploy/mac/install.sh` を実行してください。"
+                        "Firefox の更新で保存形式が変わった可能性があるときは、アプリの更新が必要です。")
             return ("主系の PC で `git pull` → `deploy\\windows\\install.ps1 -FirefoxProfile` を実行してください。"
                     "Firefox の更新で保存形式が変わった可能性があるときは、アプリの更新が必要です。"
                     "急ぐ場合は、従来どおり cookies.txt を書き出して置き、`install.ps1 -NoFirefoxProfile` で切り替えられます。")
         if status == "not_member":
-            return ("ログイン用ショートカット「achichi-notifier YouTube login」で開き、右上のアカウントを確認して、"
+            return (f"{_login_launcher(platform)}で開き、右上のアカウントを確認して、"
                     "メンバー加入済みのアカウントでログインし直してください。")
-        return FIREFOX_LOGIN_FIX
+        return _firefox_login_fix(platform)
     if _in_github():
         return ("Cookie はクラウドに置かない運用です。GitHub の Secret `YOUTUBE_COOKIES_B64` を "
                 "`gh secret delete YOUTUBE_COOKIES_B64` で削除してください。")
@@ -494,8 +534,12 @@ def _primary_down_alert(cfg: Config, discord: DiscordClient | None, state: State
         log.warning("could not send the primary-down alert: %s", exc)
 
 
-def _browser_refresh_alert(cfg: Config, discord: DiscordClient | None, state: State) -> None:
-    """The daily headless visit keeps failing (read from browser-refresh.json)."""
+def _browser_refresh_alert(cfg: Config, discord: DiscordClient | None, state: State,
+                           role: str = "primary", platform: str | None = None) -> None:
+    """The daily headless visit keeps failing (read from browser-refresh.json). Each runner
+    reports its own Firefox profile, under its own throttle key."""
+    platform = platform or PLATFORM
+    key = "browser_refresh" if role == "primary" else f"browser_refresh:{role}"
     from .browser_refresh import read_status
     status = read_status(cfg.firefox_profile)
     failures = int(status.get("consecutive_failures") or 0)
@@ -505,27 +549,35 @@ def _browser_refresh_alert(cfg: Config, discord: DiscordClient | None, state: St
     if discord is None or cfg.state_backend != "discord" or not cfg.state_channel_id:
         return
     now = datetime.now(timezone.utc)
-    if _fresh(state.alerts.get("browser_refresh"), now, COOKIE_ALERT_INTERVAL.total_seconds() / 60):
+    if _fresh(state.alerts.get(key), now, COOKIE_ALERT_INTERVAL.total_seconds() / 60):
         return
-    attempt, alerted = parse_time(status.get("last_attempt")), parse_time(state.alerts.get("browser_refresh"))
+    attempt, alerted = parse_time(status.get("last_attempt")), parse_time(state.alerts.get(key))
     if attempt and alerted and attempt <= alerted:
         return  # no new refresh attempt since the last alert (the user may have fixed it)
     last = str(status.get("last_result") or "?")[:60]
+    mac = platform == "darwin"
+    where = _runner_label(role)
     if stuck:
         days = int(status.get("in_use_streak") or 0)
-        message = (f"⚠️ **Bot 用 Firefox が {days} 日続けて「使用中」で、毎日の自動更新ができていません**。\n"
-                   "ログイン用ショートカット（achichi-notifier YouTube login）で開いた Firefox を開いたままに"
-                   "していないか確認し、閉じてください。ウィンドウが見当たらない場合はタスク マネージャーで"
-                   "firefox.exe を終了するか、PC を再起動してください。")
+        message = (f"⚠️ **Bot 用 Firefox が {days} 日続けて「使用中」で、毎日の自動更新ができていません**（{where}）。\n"
+                   f"{_login_launcher(platform)}で開いた Firefox を開いたままに"
+                   "していないか確認し、閉じてください。"
+                   + ("ウィンドウが見当たらない場合はアクティビティモニタで firefox を終了するか、Mac を再起動してください。"
+                      if mac else
+                      "ウィンドウが見当たらない場合はタスク マネージャーで firefox.exe を終了するか、PC を再起動してください。"))
     else:
-        message = (f"⚠️ **Bot 用 Firefox の毎日の自動更新が {failures} 回続けて失敗しています**（最後: `{last}`）。\n"
+        message = (f"⚠️ **Bot 用 Firefox の毎日の自動更新が {failures} 回続けて失敗しています**（{where}、最後: `{last}`）。\n"
                    "メン限投稿のチェックはまだ動いていますが、このままだとログインが切れるおそれがあります。\n"
-                   "対処: 主系の PC で `%LOCALAPPDATA%\\achichi-notifier\\browser-refresh.log` を確認し、Firefox が"
-                   "インストールされているか確かめてください。手動で 1 回動かす場合は "
-                   "`Start-ScheduledTask -TaskName achichi-notifier-browser`。")
+                   + ("対処: Mac で `~/Library/Application Support/achichi-notifier/browser-refresh.log` を確認し、"
+                      "Firefox（/Applications/Firefox.app）が入っているか確かめてください。手動で 1 回動かす場合は "
+                      "`launchctl kickstart gui/$(id -u)/com.achichi.notifier.browser`。"
+                      if mac else
+                      "対処: 主系の PC で `%LOCALAPPDATA%\\achichi-notifier\\browser-refresh.log` を確認し、Firefox が"
+                      "インストールされているか確かめてください。手動で 1 回動かす場合は "
+                      "`Start-ScheduledTask -TaskName achichi-notifier-browser`。"))
     try:
         discord.send(cfg.state_channel_id, {"content": message, "allowed_mentions": {"parse": []}})
-        state.alerts["browser_refresh"] = now_iso()
+        state.alerts[key] = now_iso()
     except DiscordError as exc:
         log.warning("could not send the browser refresh alert: %s", exc)
 
@@ -732,8 +784,8 @@ def run(cfg: Config, role: str = "primary", dry_run: bool = False) -> int:
         _cookie_alert(cfg, discord, state, role, result.member_status, result.member_detail,
                       dry_run, streak=int(runner.get("member_fail_streak") or 0),
                       source=result.cookie_source)
-    if role == "primary" and cfg.firefox_profile and not dry_run:
-        _browser_refresh_alert(cfg, discord, state)
+    if cfg.firefox_profile and not dry_run:
+        _browser_refresh_alert(cfg, discord, state, role)
 
     targets_all = dests.resolve(cfg, state)
     recent = _RecentlyPosted(discord) if discord is not None and not dry_run else None
@@ -824,14 +876,21 @@ def preview(cfg: Config, send: bool = False, dest_name: str = dests.MAIN) -> int
     notifier = Notifier(cfg, yt)
     result = CollectResult()
     refs = notifier.collect_video_refs(result)
-    picked: dict[str, VideoRef] = {}
+    picked: dict[str, VideoInfo] = {}
     for ref in refs:
         group = "short" if ref.is_short else ("live" if "streams" in ref.sources else "video")
-        picked.setdefault(group, ref)
-    notes: list[Notification] = []
-    for ref in picked.values():
+        if group in picked:
+            continue
+        if group == "live" and ref.live_hint not in ("upcoming", "live"):
+            continue  # stream previews show an open slot or a running stream, never an old archive
         info = yt.fetch_video_info(ref)
-        notes.append(Notification(info.kind, "video", ref.video_id, notifier.now,
+        if excluded_stream(cfg, info.kind, info.title):
+            log.info("preview: stream %s is excluded by EXCLUDE_LIVE_TITLES (%s)", ref.video_id, info.title)
+            continue
+        picked[group] = info
+    notes: list[Notification] = []
+    for info in picked.values():
+        notes.append(Notification(info.kind, "video", info.video_id, notifier.now,
                                   render.video_payload(info, result.meta, None)))
     member_page = notifier._fetch_member_page(result)
     try:
@@ -873,7 +932,9 @@ def preview(cfg: Config, send: bool = False, dest_name: str = dests.MAIN) -> int
             if not channel or not dest.wants(note.kind):
                 continue
             payload = render.apply_mention(note.payload, None)  # previews never ping anyone
-            payload["content"] = "【プレビュー】" + payload["content"]
+            # Looks exactly like the real notification, but silent; the flag also keeps the
+            # "already posted?" check from mistaking a preview for the real thing.
+            payload["flags"] = SUPPRESS_NOTIFICATIONS
             discord.send(channel, payload)
             log.info("sent preview %s to %s", note.kind, dest.name)
     else:

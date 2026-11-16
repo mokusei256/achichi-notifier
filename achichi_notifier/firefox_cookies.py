@@ -9,6 +9,8 @@ Errors never contain cookie names or values.
 from __future__ import annotations
 
 import contextlib
+import errno
+import os
 import shutil
 import sqlite3
 import sys
@@ -84,18 +86,42 @@ def _wal_generation(path: Path) -> bytes | None:
 
 
 def profile_in_use(profile_dir: Path) -> bool | None:
-    """Windows: Firefox keeps parent.lock open with share mode 0 (and never deletes it)."""
-    if sys.platform != "win32":
+    """Is a Firefox process using this profile right now? None when it cannot be told.
+
+    Windows: Firefox keeps parent.lock open with share mode 0 (and never deletes it).
+    macOS / Linux: Firefox holds a POSIX record lock (fcntl F_SETLK, write) on .parentlock for
+    as long as it runs; the kernel drops it when the process dies, so a crash leaves no stale
+    lock. The probe takes the same lock for an instant and releases it.
+    """
+    if sys.platform == "win32":
+        try:
+            with open(profile_dir / "parent.lock", "rb"):
+                return False
+        except FileNotFoundError:
+            return False
+        except PermissionError:
+            return True
+        except OSError:
+            return None
+    try:
+        import fcntl
+    except ImportError:  # pragma: no cover - non-POSIX platforms other than Windows
         return None
     try:
-        with open(profile_dir / "parent.lock", "rb"):
-            return False
+        fd = os.open(profile_dir / ".parentlock", os.O_RDWR)
     except FileNotFoundError:
         return False
-    except PermissionError:
-        return True
     except OSError:
         return None
+    try:
+        try:
+            fcntl.lockf(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            return True if exc.errno in (errno.EACCES, errno.EAGAIN) else None
+        fcntl.lockf(fd, fcntl.LOCK_UN)
+        return False
+    finally:
+        os.close(fd)
 
 
 def _snapshot(profile_dir: Path, workdir: Path, attempts: int = 4) -> Path:

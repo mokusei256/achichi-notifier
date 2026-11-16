@@ -62,13 +62,23 @@ def _safe_console() -> None:
 
 def _refresh_browser(cfg: Config, dwell: float | None, url: str) -> int:
     log = logging.getLogger("achichi_notifier")
-    if sys.platform != "win32":
-        log.info("refresh-browser only runs on Windows; nothing to do here")
+    if sys.platform not in ("win32", "darwin"):
+        log.info("refresh-browser only runs on Windows and macOS; nothing to do here")
         return 0
     if not cfg.firefox_profile:
         log.error("YOUTUBE_FIREFOX_PROFILE is not set")
         return 2
     from .browser_refresh import GOOD, NOT_COUNTED, find_firefox, refresh
+    if sys.platform != "win32":
+        # launchd stops the job with SIGTERM (install.sh re-run, uninstall.sh). Turn that into
+        # SystemExit so refresh()'s cleanup still stops the headless Firefox, which runs in its
+        # own process group and would otherwise keep holding the bot profile.
+        import signal
+
+        def _stop(signum, _frame):
+            raise SystemExit(128 + signum)
+        for sig in (signal.SIGTERM, signal.SIGHUP):
+            signal.signal(sig, _stop)
     firefox = find_firefox(str(cfg.firefox_exe) if cfg.firefox_exe else None)
     result = refresh(cfg.firefox_profile, firefox, dwell=dwell or cfg.refresh_seconds, url=url)
     return 0 if result in GOOD + NOT_COUNTED else 1
@@ -239,14 +249,15 @@ def main(argv: list[str] | None = None) -> int:
     p_run.add_argument("--state-file", help="use a local state file instead of Discord")
     p_run.add_argument("--max-age-hours", type=float, help="override MAX_AGE_HOURS")
 
-    p_prev = sub.add_parser("preview", help="render the latest item of each type")
+    p_prev = sub.add_parser("preview", help="render the latest item of each type (streams: open slots "
+                                            "or live only, EXCLUDE_LIVE_TITLES skipped)")
     p_prev.add_argument("--send", action="store_true", help="actually post the previews")
     p_prev.add_argument("--dest", default="main", help="destination to preview for (default: main)")
 
     sub.add_parser("check", help="gateway login + permission and YouTube checks")
 
     p_ref = sub.add_parser("refresh-browser",
-                           help="Windows: open YouTube headlessly in the bot's Firefox profile (daily task)")
+                           help="open YouTube headlessly in the bot's Firefox profile (daily task, Windows/macOS)")
     p_ref.add_argument("--dwell", type=float, help="seconds to keep the page open (default FIREFOX_REFRESH_SECONDS)")
     p_ref.add_argument("--url", default="https://www.youtube.com/")
 

@@ -242,3 +242,31 @@ def test_wal_generation_change_forces_a_new_snapshot(tmp_path, monkeypatch):
         fc.read_youtube_cookies(prof, now=NOW)
     conn.close()
     assert "kept changing" in str(err.value) and err.value.transient
+
+
+HOLD_LOCK = r'''
+import fcntl, os, sys, time
+fd = os.open(sys.argv[1], os.O_RDWR | os.O_CREAT)
+fcntl.lockf(fd, fcntl.LOCK_EX)  # what Firefox does to .parentlock (F_SETLK, write)
+print("locked", flush=True)
+time.sleep(60)
+'''
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX record lock on .parentlock")
+def test_posix_profile_lock_is_detected_and_released(tmp_path):
+    prof = tmp_path / "prof"
+    prof.mkdir()
+    assert fc.profile_in_use(prof) is False  # no lock file yet: never started
+    (prof / ".parentlock").write_text("")
+    assert fc.profile_in_use(prof) is False  # left behind by an exited Firefox: not in use
+    holder = subprocess.Popen([sys.executable, "-I", "-c", HOLD_LOCK, str(prof / ".parentlock")],
+                              stdout=subprocess.PIPE, text=True)
+    try:
+        assert holder.stdout.readline().strip() == "locked"
+        assert fc.profile_in_use(prof) is True
+        assert fc.profile_in_use(prof) is True  # probing twice does not steal or drop it
+    finally:
+        holder.kill()
+        holder.wait()
+    assert fc.profile_in_use(prof) is False  # the kernel dropped it with the process

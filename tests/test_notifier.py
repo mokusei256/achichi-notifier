@@ -5,7 +5,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from achichi_notifier import notifier
-from achichi_notifier.config import Config
+from achichi_notifier.config import DEFAULT_EXCLUDE_LIVE_TITLES, Config, ConfigError
 from dataclasses import replace
 
 from achichi_notifier.state import FileStateStore, State
@@ -747,3 +747,173 @@ def test_check_judges_sources_like_a_run(yt, ok, capsys):
     if yt.rss_fails:  # NG exactly when a tab is down too; the harmless-info line only when covered
         assert any(p.startswith("YouTube RSS:") for p in problems) == (not ok)
         assert ("通知には影響しません" in out) == ok
+
+
+# ---------------------------------------------------------------- free chat rooms
+
+FREE_CHAT_TITLES = [
+    "【フリーチャット】概要欄にお知らせ随時追加のじゃ！",
+    "ﾌﾘｰﾁｬｯﾄ",  # half-width katakana
+    "【ＦＲＥＥ　ＣＨＡＴ】",  # full-width letters and space
+    "Free-Chat room",
+    "フリチャ置き場",
+    "ふりーちゃっと",
+]
+
+
+def _seeded(tmp_path, capsys, **overrides):
+    cfg = _cfg(tmp_path, **overrides)
+    _run(cfg, capsys)  # first run only marks what exists as seen
+    return cfg
+
+
+@pytest.mark.parametrize("title", FREE_CHAT_TITLES)
+def test_free_chat_slot_is_never_announced(tmp_path, capsys, caplog, title):
+    cfg = _seeded(tmp_path, capsys)
+    FakeYouTube.videos = [
+        VideoRef("freechat001", {"streams", "rss"}, title=title, live_hint="upcoming"),
+        VideoRef("slot0000001", {"streams"}, title="【歌枠】フリー素材で遊ぶ", live_hint="upcoming"),
+        *FakeYouTube.videos,
+    ]
+    with caplog.at_level(logging.INFO, logger="achichi_notifier"):
+        _, out, kinds = _run(cfg, capsys)
+    assert kinds == ["live_upcoming"]  # the real slot still goes out
+    assert "slot0000001" in out and "freechat001" not in out
+    assert "freechat001" in _state(tmp_path)["videos"]  # settled, so it is not re-checked every run
+    assert "freechat001 is excluded by EXCLUDE_LIVE_TITLES" in caplog.text
+    _, _, kinds = _run(cfg, capsys)
+    assert kinds == []
+
+
+def test_free_chat_is_excluded_even_without_the_watch_page(tmp_path, capsys, monkeypatch):
+    cfg = _seeded(tmp_path, capsys)
+    FakeYouTube.videos = [VideoRef("freechat001", {"streams"}, title="フリーチャット", live_hint="upcoming"),
+                          *FakeYouTube.videos]
+    # bot check on the watch page: the kind and the title come from the tab listing only
+    monkeypatch.setattr(FakeYouTube, "fetch_video_info", lambda self, ref: classify_video(None, ref))
+    _, _, kinds = _run(cfg, capsys)
+    assert kinds == []
+
+
+def test_free_chat_words_do_not_hide_a_regular_video(tmp_path, capsys):
+    cfg = _seeded(tmp_path, capsys)
+    FakeYouTube.videos = [
+        VideoRef("clip0000001", {"videos", "rss"}, title="フリーチャットで起きた事件まとめ"),
+        VideoRef("short000001", {"shorts"}, is_short=True, title="free chat の切り抜き"),
+        *FakeYouTube.videos,
+    ]
+    _, _, kinds = _run(cfg, capsys)
+    assert sorted(kinds) == ["short", "video"]
+
+
+@pytest.mark.parametrize("pattern, announced", [
+    (None, ["freechat001", "taikijo0001"]),  # EXCLUDE_LIVE_TITLES=none
+    ("待機所", ["freechat001"]),  # a custom pattern replaces the default one
+])
+def test_exclusion_follows_the_setting(tmp_path, capsys, pattern, announced):
+    cfg = _seeded(tmp_path, capsys, exclude_live_titles=pattern)
+    FakeYouTube.videos = [
+        VideoRef("freechat001", {"streams"}, title="【フリーチャット】", live_hint="upcoming"),
+        VideoRef("taikijo0001", {"streams"}, title="【待機所】", live_hint="upcoming"),
+        *FakeYouTube.videos,
+    ]
+    _, out, _ = _run(cfg, capsys)
+    assert [v for v in ("freechat001", "taikijo0001") if v in out] == announced
+
+
+@pytest.mark.parametrize("raw, expected", [
+    (None, DEFAULT_EXCLUDE_LIVE_TITLES),
+    ("  ", DEFAULT_EXCLUDE_LIVE_TITLES),
+    ("none", None),
+    ("OFF", None),
+    ("待機所|フリーチャット", "待機所|フリーチャット"),
+])
+def test_exclude_setting_from_env(monkeypatch, raw, expected):
+    if raw is None:
+        monkeypatch.delenv("EXCLUDE_LIVE_TITLES", raising=False)
+    else:
+        monkeypatch.setenv("EXCLUDE_LIVE_TITLES", raw)
+    assert Config.from_env().exclude_live_titles == expected
+
+
+def test_broken_exclude_pattern_is_a_config_error(monkeypatch):
+    monkeypatch.setenv("EXCLUDE_LIVE_TITLES", "(フリーチャット")
+    with pytest.raises(ConfigError, match="EXCLUDE_LIVE_TITLES"):
+        Config.from_env()
+
+
+def _preview(cfg, capsys):
+    assert notifier.preview(cfg) == 0
+    out = capsys.readouterr().out
+    return out, [line.split()[2] for line in out.splitlines() if line.startswith("--- [preview]")]
+
+
+def test_preview_shows_no_stream_when_only_a_free_chat_is_open(tmp_path, capsys):
+    FakeYouTube.videos = [
+        VideoRef("freechat001", {"streams"}, title="【フリーチャット】概要欄", live_hint="upcoming"),
+        VideoRef("archive0001", {"streams"}, title="昨日の配信"),
+        *FakeYouTube.videos,
+    ]
+    out, kinds = _preview(_cfg(tmp_path), capsys)
+    assert not any(k.startswith("live") for k in kinds)
+    assert "freechat001" not in out and "archive0001" not in out
+    assert "video" in kinds  # the other previews are unaffected
+
+
+def test_preview_finds_a_real_slot_listed_after_the_free_chat(tmp_path, capsys):
+    FakeYouTube.videos = [
+        VideoRef("freechat001", {"streams"}, title="【フリーチャット】", live_hint="upcoming"),
+        VideoRef("slot0000001", {"streams"}, title="【歌枠】", live_hint="upcoming"),
+        *FakeYouTube.videos,
+    ]
+    out, kinds = _preview(_cfg(tmp_path), capsys)
+    assert kinds.count("live_upcoming") == 1
+    assert "slot0000001" in out and "freechat001" not in out
+
+
+@pytest.mark.parametrize("pattern, title", [
+    ("【フリーチャット】概要欄にお知らせ随時追加のじゃ！", "【フリーチャット】概要欄にお知らせ随時追加のじゃ！"),  # pasted verbatim
+    ("【待機所】　雑談（常設）", "【待機所】　雑談（常設）配信"),  # full-width space and brackets
+    ("ﾏｲｸﾃｽﾄ", "ﾏｲｸﾃｽﾄ枠"),  # half-width kana pasted as-is
+    ("マイクテスト", "ﾏｲｸﾃｽﾄ枠"),  # full-width-kana pattern also covers half-width titles
+    ("free talk", "ＦＲＥＥ　ＴＡＬＫ"),  # ASCII pattern also covers full-width letters
+])
+def test_custom_pattern_matches_text_pasted_from_a_title(tmp_path, pattern, title):
+    cfg = _cfg(tmp_path, exclude_live_titles=pattern)
+    assert notifier.excluded_stream(cfg, "live_upcoming", title)
+
+
+def test_full_width_brackets_in_a_pattern_stay_literal(tmp_path):
+    cfg = _cfg(tmp_path, exclude_live_titles="［告知］")
+    assert notifier.excluded_stream(cfg, "live_upcoming", "［告知］新衣装")
+    assert not notifier.excluded_stream(cfg, "live_upcoming", "告白の練習")  # not a character class
+
+
+@pytest.mark.parametrize("raw", ["フリーチャット|", "(フリーチャット)?", "|待機所"])
+def test_pattern_matching_every_title_is_rejected(monkeypatch, raw):
+    monkeypatch.setenv("EXCLUDE_LIVE_TITLES", raw)
+    with pytest.raises(ConfigError, match="empty title"):
+        Config.from_env()
+
+
+def test_sent_previews_look_real_but_are_silent(tmp_path, monkeypatch):
+    sent = []
+
+    class Discord:
+        def __init__(self, token):
+            pass
+
+        def send(self, channel, payload):
+            sent.append(payload)
+            return {}
+
+    monkeypatch.setattr(notifier, "DiscordClient", Discord)
+    monkeypatch.setattr(notifier, "make_store", lambda cfg, discord: FileStateStore(cfg.state_file))
+    FakeYouTube.videos = [VideoRef("slot0000001", {"streams"}, title="【歌枠】", live_hint="upcoming"),
+                          *FakeYouTube.videos]
+    cfg = _cfg(tmp_path, discord_token="token")
+    assert notifier.preview(cfg, send=True) == 0
+    assert sent and all(p["flags"] & notifier.SUPPRESS_NOTIFICATIONS for p in sent)
+    assert all("プレビュー" not in p["content"] for p in sent)
+    assert all(p["allowed_mentions"] == {"parse": []} for p in sent)
+    assert any(p["content"] == "📅 配信枠が作成されました" for p in sent)

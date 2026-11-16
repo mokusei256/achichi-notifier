@@ -2,6 +2,7 @@
 
 Windows: run by the 'achichi-notifier-browser' scheduled task as
     pythonw.exe -m achichi_notifier --env-file ... --log-file ... refresh-browser
+macOS: run by the launchd agent 'com.achichi.notifier.browser' (deploy/mac/install.sh).
 Writes <app dir>/browser-refresh.json, which the 5-minute run reads for the #管理 alert.
 Never logs cookie names or values (only booleans / counts).
 """
@@ -12,6 +13,8 @@ import hashlib
 import json
 import logging
 import os
+import re
+import signal
 import subprocess
 import sys
 import time
@@ -77,8 +80,11 @@ def _digests(profile: Path) -> dict[str, str] | None:
     return out
 
 
-def find_firefox(explicit: str | None = None) -> Path | None:
+def find_firefox(explicit: str | None = None, platform: str = sys.platform) -> Path | None:
     candidates = [explicit] if explicit else []
+    if platform == "darwin":
+        for apps in ("/Applications", os.path.expanduser("~/Applications")):
+            candidates.append(os.path.join(apps, "Firefox.app", "Contents", "MacOS", "firefox"))
     for var in ("ProgramFiles", "ProgramFiles(x86)", "LOCALAPPDATA"):
         base = os.environ.get(var)
         if base:
@@ -96,11 +102,39 @@ def _browser_env() -> dict:
     return env
 
 
+HEADLESS_ARG = re.compile(r"(^|\s)--?headless(\s|$)")
+
+
+def _kill_leftover_posix(profile: Path, ps=None, kill=os.kill) -> int:
+    """macOS / Linux: this user's processes started with --headless and this exact profile path
+    (ps prints the arguments space-joined, so the path must be followed by a space or the end:
+    .../firefox-profile-old never matches)."""
+    if ps is None:
+        try:
+            ps = subprocess.run(["ps", "-x", "-o", "pid=,args="], capture_output=True, text=True,
+                                timeout=30).stdout
+        except (OSError, subprocess.TimeoutExpired):
+            return 0
+    path = re.compile(r"(^|\s)" + re.escape(str(Path(profile))) + r"(\s|$)")
+    killed = 0
+    for line in ps.splitlines():
+        pid, _, args = line.strip().partition(" ")
+        if not pid.isdigit() or int(pid) == os.getpid():
+            continue
+        if HEADLESS_ARG.search(args) and path.search(args):
+            try:
+                kill(int(pid), signal.SIGKILL)
+                killed += 1
+            except (ProcessLookupError, PermissionError):
+                pass
+    return killed
+
+
 def kill_leftover_headless(profile: Path) -> int:
     """Stop headless Firefox processes left over on the bot profile (never touches windows the
     user opened: only processes started with --headless for this profile)."""
     if sys.platform != "win32":
-        return 0
+        return _kill_leftover_posix(profile)
     # The path travels in an environment variable and is regex-escaped, so quotes, brackets or
     # wildcard characters in it can neither break the script nor widen the match; the path must
     # be a whole argument (so ...\firefox-profile-old or another profile never matches).
@@ -127,8 +161,26 @@ def _taskkill(proc: subprocess.Popen) -> None:
         # tree (browser + content processes) hangs below it.
         subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"], capture_output=True,
                        creationflags=NO_WINDOW, timeout=60)
+        return
+    # POSIX: Firefox was started in its own session, so its content processes share its
+    # process group; never signal a group this program itself belongs to.
+    try:
+        group = os.getpgid(proc.pid)
+    except (ProcessLookupError, PermissionError):
+        return
+    if group == proc.pid and group != os.getpgrp():
+        try:
+            os.killpg(group, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
     else:
         proc.kill()
+
+
+def _launch_options() -> dict:
+    if sys.platform == "win32":
+        return {"creationflags": NO_WINDOW}
+    return {"start_new_session": True}  # own process group: one kill stops every helper
 
 
 def _today() -> str:
@@ -181,7 +233,7 @@ def refresh(profile: Path, firefox: Path | None, dwell: float = DEFAULT_DWELL,
     try:
         proc = popen([str(firefox), "--headless", "--profile", str(profile), url], env=env,
                      stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                     stderr=subprocess.DEVNULL, creationflags=NO_WINDOW)
+                     stderr=subprocess.DEVNULL, **_launch_options())
     except OSError as exc:
         return finish(f"launch-failed:{exc.__class__.__name__}")
     try:

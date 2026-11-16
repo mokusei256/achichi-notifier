@@ -40,6 +40,7 @@ GitHub Actions：テスト専用（push のたびに自動テスト。Bot の実
 - **Mac は予備系**です。主系（Windows）の最終成功から `FALLBACK_AFTER_MINUTES`（既定 15 分）が過ぎたときだけ全体の確認を代行します。それ以外の回は、Mac に Cookie があり主系の Cookie が動いていなければメン限投稿の確認（`MEMBER_CHECK_MINUTES`、既定 10 分ごと）だけを行い、公開投稿は主系に任せます。
 - 初回実行時は、その時点で見えている動画・投稿をすべて既読扱いにし、通知は送りません（Cookie を入れて最初のメン限確認でも、既存のメン限投稿は既読扱いになります）。
 - 取りこぼしや状態の消失があったときに大量通知しないよう、`MAX_AGE_HOURS`（既定 72 時間）より古いものは通知しません。
+- **フリーチャットの枠は通知しません。** タイトルに「フリーチャット」「フリチャ」「Free Chat」などが入った配信枠は、見つけても既読にするだけです（全角・半角や大文字・小文字の違いも同じ扱い）。対象は配信（枠・配信中・アーカイブ）だけで、動画やショートは除外しません。条件は `EXCLUDE_LIVE_TITLES` で変えられます。
 
 ---
 
@@ -74,7 +75,7 @@ Bot として一度ゲートウェイにログインし、権限と YouTube へ�
 uv run python -m achichi_notifier check
 ```
 
-最新の動画・ショート・配信・投稿を 1 件ずつ、通知と同じ見た目で出力します（`--send` を付けると実際にチャンネルへ投稿します）。
+最新の動画・ショート・投稿を 1 件ずつ、通知と同じ見た目で出力します。配信は、立っている枠か配信中のものがあるときだけ出します（アーカイブと、`EXCLUDE_LIVE_TITLES` に当てはまるフリーチャットなどの枠は出しません）。`--send` を付けると実際にチャンネルへ投稿します。投稿したプレビューは本物の通知と同じ見た目ですが、誰にもメンションせず、通知音やスマホへのプッシュ通知も鳴らない「サイレント」メッセージになります。
 
 ```bash
 uv run python -m achichi_notifier preview
@@ -191,6 +192,7 @@ cd ~/Documents/DiscordBot_achichi
 補足:
 
 - アプリは `~/Library/Application Support/achichi-notifier/` にコピーして動かします。`~/Documents` 配下は macOS のプライバシー保護（TCC）により、launchd から読めないためです。
+- メン限投稿の Cookie は、Mac でも「Bot 用 Firefox」がおすすめです（[6.](#6-メン限投稿用の-cookie自宅の-pc-にだけ置く) の「Mac も Bot 用 Firefox にする」）。
 - **コード・`.env`・Cookie を変更したら、もう一度 `install.sh` を実行**してください。
 - コードを更新するときは、**Windows と Mac の両方を同じ版に**してください（Windows: `git pull` → `install.ps1`、Mac: `install.sh`）。版が違うと、古い版が新しい版の記録（保留中のメン限投稿など）を消してしまうことがあります。
 - **スリープ中は止まります。** メン限投稿はスリープ中には検知されず、復帰後に見つけたものを通知します（投稿から `MAX_AGE_HOURS`＝72 時間以内のもの）。
@@ -229,7 +231,7 @@ ROLE=primary ./deploy/mac/install.sh
 - **Windows 用と Mac 用は、それぞれ別のシークレットウィンドウで書き出してください**（別のセッションになり、片方が失効してももう片方が残ります。同じファイルを両方に入れると、失効も同時に起きます）。
 - GitHub などのクラウドには置かないでください。
 
-#### おすすめ: Windows は「Bot 用 Firefox」（書き出し不要）
+#### おすすめ: 「Bot 用 Firefox」（書き出し不要・Windows と Mac）
 
 Bot 専用の Firefox プロファイルに一度ログインしておくと、Bot が**毎回そこから最新の Cookie を読みます**。さらに毎日 1 回、画面を出さずにその Firefox で YouTube を開き、ブラウザ自身にログイン状態を更新させます。Cookie の書き出しは不要になります（Chrome から書き出した Cookie が数時間で切れたのは、Chrome が Cookie を PC に結び付ける仕組みのためで、Firefox にはこの仕組みがありません）。
 
@@ -253,10 +255,29 @@ Bot 専用の Firefox プロファイルに一度ログインしておくと、B
 
 注意:
 
-- このプロファイルには YouTube だけでなく **Google アカウント全体のログイン状態**が入ります。本人だけが読める場所（`%LOCALAPPDATA%\achichi-notifier\firefox-profile`）に置いていますが、**このプロファイルで普段のブラウジングはしない**でください。**ほかの PC にコピーしない**でください（Mac は自分で書き出した cookies.txt のまま使います）。
+- このプロファイルには YouTube だけでなく **Google アカウント全体のログイン状態**が入ります。本人だけが読める場所（`%LOCALAPPDATA%\achichi-notifier\firefox-profile`）に置いていますが、**このプロファイルで普段のブラウジングはしない**でください。**ほかの PC にコピーしない**でください（Mac は Mac で別にログインします。別のセッションになるので、片方が切れてももう片方が残ります）。
 - 本当にログインが切れたとき（ログアウト・パスワード変更など）は #管理 に警告が届きます。手順 2 をもう一度行えば、5 分以内に自動で戻ります。
 
-#### 従来の方法: cookies.txt を書き出す（Mac・予備用）
+##### Mac も Bot 用 Firefox にする
+
+Windows が止まったときに Mac がメン限投稿まで代わりに確認できるよう、Mac にも同じ仕組みを入れられます（Mac は Mac で別にログインします）。
+
+1. Firefox を入れる（まだなら）: `brew install --cask firefox`
+2. インストールする（一度付ければ、次からは付けなくても Bot 用 Firefox を使い続けます）:
+
+   ```bash
+   cd ~/Documents/DiscordBot_achichi
+   FIREFOX_PROFILE=1 ./deploy/mac/install.sh
+   ```
+
+3. 自動で開く Firefox（あとから開くときは、ホームの「アプリケーション」にある **「achichi-notifier YouTube login」**。Spotlight で「achichi」でも出ます）で、メンバー加入済みのアカウントで YouTube にログインし、**ログアウトせずにメニューから Firefox を終了**します。初回だけ「インターネットからダウンロードされたアプリケーションです」と出たら「開く」を選びます。パスワードは保存しないでください。
+4. 確認する: `cd ~/Library/Application\ Support/achichi-notifier && ./venv/bin/python -m achichi_notifier check`
+5. 毎日の更新（既定 5:30、`REFRESH_AT=HH:MM` で変更。スリープ中なら起きたときに実行）を 1 回試す: `launchctl kickstart gui/$(id -u)/com.achichi.notifier.browser`（約 3 分後に `~/Library/Application Support/achichi-notifier/browser-refresh.log` に結果が出ます）
+6. 以前の `cookies.txt`（`~/Library/Application Support/achichi-notifier/cookies.txt` と `~/Documents/DiscordBot_achichi/cookies.txt`）は使われなくなるので削除します。
+
+やめるときは `NO_FIREFOX_PROFILE=1 ./deploy/mac/install.sh`（フォルダは残ります）。
+
+#### 従来の方法: cookies.txt を書き出す
 
 > ⚠️ **Cookie はアカウントへのログイン権限そのもの**です。中身をチャット・Issue・Discord・AI への質問・スクリーンショットに**絶対に貼らないでください**。ファイルの共有・コミットもしないでください。
 
@@ -369,7 +390,7 @@ uv run python -m achichi_notifier dest list                       # 一覧
 uv run python -m achichi_notifier dest check bigserver --send-test # 権限の確認とテスト送信
 uv run python -m achichi_notifier dest disable bigserver          # 一時停止（enable で再開）
 uv run python -m achichi_notifier dest remove bigserver           # 削除
-uv run python -m achichi_notifier preview --send --dest bigserver # 見た目の確認（【プレビュー】付き・メンションなし）
+uv run python -m achichi_notifier preview --send --dest bigserver # 見た目の確認（メンション・プッシュ通知なし）
 ```
 
 - 1 つの送り先に送れなくても、ほかの送り先には届きます（#管理 に「送り先「〇〇」に通知を送れませんでした」と届きます）。
@@ -386,7 +407,7 @@ uv run python -m achichi_notifier preview --send --dest bigserver # 見た目の
 | `run --role primary` | 1 回確認して新着を投稿（主系の PC 用） |
 | `run --role fallback` | 主系が `FALLBACK_AFTER_MINUTES` 以上止まっているときは全体を確認。Cookie があれば `MEMBER_CHECK_MINUTES` ごとにメン限投稿を確認（Mac 用） |
 | `run --dry-run --state-file /tmp/achichi-test-state.json` | 投稿せずに表示するだけ。状態はリポジトリの外の一時ファイルに保存し、Discord の状態には触れない |
-| `preview [--send]` | 種類ごとの最新 1 件を通知の見た目で表示／送信 |
+| `preview [--send]` | 種類ごとの最新 1 件を通知の見た目で表示／送信（配信は立っている枠・配信中のみ、フリーチャットなどは除く。送信はサイレント） |
 | `check` | ゲートウェイログイン・権限（追加した送り先も含む）・YouTube・Cookie を確認 |
 | `dest list/add/remove/enable/disable/check` | 通知の送り先を管理（[上記](#別のサーバーにも通知する送り先の追加)） |
 
@@ -403,6 +424,7 @@ uv run python -m achichi_notifier preview --send --dest bigserver # 見た目の
 - `FALLBACK_AFTER_MINUTES`（既定 15）: 予備系（Mac）が全体の確認を代行し始めるまでの猶予。`0` にすると常に両方が動く
 - `MEMBER_CHECK_MINUTES`（既定 10）: Mac がメン限投稿を確認する間隔（Cookie があるときだけ。実際は launchd の起動間隔 3 分単位）
 - `MAX_AGE_HOURS`（既定 72）: これより古いものは初めて見つけても通知しない
+- `EXCLUDE_LIVE_TITLES`（既定 `フリーチャット|フリチャ|ふりーちゃっと|free[\s_-]*chat`）: タイトルがこの正規表現に当てはまる配信は通知しない。タイトルはそのままの形と NFKC 正規化した形（半角カナ→全角、全角英数・記号→半角）の両方で照合し、大文字・小文字は区別しない。枠のタイトルの一部をそのまま貼り付けても効く。表記ゆれまで拾いたいときは、パターンを半角英数と全角カナで書く。`none` で除外なし。空のタイトルにも当てはまるパターン（末尾の `|` など）はエラー
 
 ## 既知の制約
 

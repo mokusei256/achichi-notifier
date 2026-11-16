@@ -3,7 +3,10 @@
 import logging
 import sqlite3
 import sys
+import time
 from pathlib import Path
+
+import pytest
 
 from achichi_notifier import browser_refresh as br
 from achichi_notifier import firefox_cookies as fc
@@ -260,3 +263,99 @@ def test_last_attempt_is_written_with_the_result(tmp_path):
     assert seen["status_while_running"]["running_since"]
     final = br.read_status(prof)
     assert final["last_attempt"] != "2026-01-01T00:00:00+00:00" and final["last_result"].startswith("launch-failed")
+
+
+def test_find_firefox_on_macos(tmp_path, monkeypatch):
+    app = tmp_path / "Applications" / "Firefox.app" / "Contents" / "MacOS"
+    app.mkdir(parents=True)
+    (app / "firefox").write_text("")
+    monkeypatch.setattr(br.os.path, "expanduser", lambda p: str(tmp_path / "Applications") if p == "~/Applications" else p)
+    for var in ("ProgramFiles", "ProgramFiles(x86)", "LOCALAPPDATA"):
+        monkeypatch.delenv(var, raising=False)
+    found = br.find_firefox(None, platform="darwin")
+    assert found in (Path("/Applications/Firefox.app/Contents/MacOS/firefox"), app / "firefox")
+    if not Path("/Applications/Firefox.app/Contents/MacOS/firefox").is_file():
+        assert found == app / "firefox"
+    assert br.find_firefox(None, platform="linux") is None or sys.platform == "win32"
+
+
+def test_posix_leftover_cleanup_only_hits_this_profiles_headless_firefox(tmp_path):
+    prof = tmp_path / "Application Support" / "achichi-notifier" / "firefox-profile"
+    ff = "/Applications/Firefox.app/Contents/MacOS/firefox"
+    ps = "\n".join([
+        f"  101 {ff} --headless --profile {prof} https://www.youtube.com/",          # ours: kill
+        f"  102 {ff} --profile {prof} https://www.youtube.com/",                     # visible: keep
+        f"  103 {ff} --headless --profile {prof}-old https://www.youtube.com/",      # sibling: keep
+        f"  104 {ff} --headless --profile /other/profile https://www.youtube.com/",  # other: keep
+        f"  105 {ff} -headless -profile {prof}",                                     # ours: kill
+        "  abc garbage line",
+    ])
+    killed = []
+    n = br._kill_leftover_posix(prof, ps=ps, kill=lambda pid, sig: killed.append(pid))
+    assert n == 2 and killed == [101, 105]
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX process groups")
+def test_posix_kill_stops_the_whole_browser_group(tmp_path):
+    import subprocess
+    # parent + a child in the same new session, like Firefox and its content processes
+    script = ("import subprocess, sys, time; "
+              "c = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)']); "
+              "print(c.pid, flush=True); time.sleep(60)")
+    proc = subprocess.Popen([sys.executable, "-I", "-c", script], stdout=subprocess.PIPE, text=True,
+                            **br._launch_options())
+    child = int(proc.stdout.readline())
+    br._taskkill(proc)
+    proc.wait(timeout=10)
+    import os
+    for _ in range(50):
+        try:
+            os.kill(child, 0)
+        except ProcessLookupError:
+            break
+        time.sleep(0.1)
+    else:
+        os.kill(child, 9)
+        raise AssertionError("the child survived")
+    assert os.getpgrp() != proc.pid  # and our own group was never signalled (we are alive)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="launchd/POSIX signals")
+def test_sigterm_to_the_refresh_job_still_stops_the_browser(tmp_path):
+    """launchd stops the job with SIGTERM (install.sh re-run, uninstall.sh): the headless browser
+    runs in its own process group, so the job itself has to take it down."""
+    import os
+    import signal
+    import subprocess
+    prof = _profile(tmp_path)
+    pidfile = tmp_path / "ff.pid"
+    fake = tmp_path / "firefox"
+    fake.write_text(f"#!{sys.executable}\nimport os, time\nopen({str(pidfile)!r}, 'w').write(str(os.getpid()))\n"
+                    "time.sleep(120)\n")
+    fake.chmod(0o755)
+    runner = (
+        "import sys, logging; from pathlib import Path\n"
+        "from achichi_notifier import __main__ as cli\n"
+        "class C: firefox_profile = Path(sys.argv[1]); firefox_exe = Path(sys.argv[2]); refresh_seconds = 100\n"
+        "sys.exit(cli._refresh_browser(C, None, 'about:blank'))\n")
+    job = subprocess.Popen([sys.executable, "-c", runner, str(prof), str(fake)])
+    try:
+        for _ in range(100):
+            if pidfile.exists() and pidfile.read_text():
+                break
+            time.sleep(0.1)
+        browser = int(pidfile.read_text())
+        job.send_signal(signal.SIGTERM)
+        assert job.wait(timeout=20) == 128 + signal.SIGTERM
+        for _ in range(50):
+            try:
+                os.kill(browser, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.1)
+        else:
+            os.kill(browser, signal.SIGKILL)
+            raise AssertionError("the headless browser outlived the job")
+    finally:
+        if job.poll() is None:
+            job.kill()
