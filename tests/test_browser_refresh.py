@@ -333,8 +333,11 @@ def test_sigterm_to_the_refresh_job_still_stops_the_browser(tmp_path):
     fake.write_text(f"#!{sys.executable}\nimport os, time\nopen({str(pidfile)!r}, 'w').write(str(os.getpid()))\n"
                     "time.sleep(120)\n")
     fake.chmod(0o755)
+    # refresh-browser is a no-op on Linux (only Windows and macOS have the daily task), but the
+    # code past that gate is the same POSIX path on both, so Linux CI runs it as macOS.
     runner = (
         "import sys, logging; from pathlib import Path\n"
+        "sys.platform = 'darwin'\n"
         "from achichi_notifier import __main__ as cli\n"
         "class C: firefox_profile = Path(sys.argv[1]); firefox_exe = Path(sys.argv[2]); refresh_seconds = 100\n"
         "sys.exit(cli._refresh_browser(C, None, 'about:blank'))\n")
@@ -344,6 +347,7 @@ def test_sigterm_to_the_refresh_job_still_stops_the_browser(tmp_path):
             if pidfile.exists() and pidfile.read_text():
                 break
             time.sleep(0.1)
+        assert pidfile.exists(), f"the refresh job never started the browser (exit code {job.poll()})"
         browser = int(pidfile.read_text())
         job.send_signal(signal.SIGTERM)
         assert job.wait(timeout=20) == 128 + signal.SIGTERM
