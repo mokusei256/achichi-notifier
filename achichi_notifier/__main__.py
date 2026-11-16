@@ -74,6 +74,45 @@ def _refresh_browser(cfg: Config, dwell: float | None, url: str) -> int:
     return 0 if result in GOOD + NOT_COUNTED else 1
 
 
+TAB_LABELS = {"videos": "動画", "shorts": "ショート", "streams": "配信"}
+
+
+def _check_sources(yt, problems: list[str]):
+    """The channel tabs, the RSS feed and the logged-out posts tab, judged the way a run judges
+    them: an RSS failure is only a problem when the tabs do not cover it. Returns the posts page."""
+    from .youtube import VIDEO_TABS
+
+    counts, tab_problems = [], []
+    for tab in VIDEO_TABS:
+        try:
+            refs, _ = yt.fetch_tab(tab)
+        except YouTubeError as exc:
+            tab_problems.append(f"{tab}: {exc}")
+            continue
+        counts.append(f"{TAB_LABELS.get(tab, tab)} {len(refs)} 件")
+        if not refs:
+            tab_problems.append(f"{tab}: 一覧が 0 件（YouTube の表示形式が変わった可能性があります）")
+    if tab_problems:
+        problems.append("YouTube タブ: " + " / ".join(tab_problems))
+    else:
+        print("✅ [OK] YouTube タブ: " + " / ".join(counts))
+    try:
+        refs, title = yt.fetch_rss()
+        print(f"✅ [OK] YouTube RSS: {title} / {len(refs)} 件")
+    except YouTubeError as exc:
+        if tab_problems:
+            problems.append(f"YouTube RSS: {exc}")
+        else:
+            print(f"ℹ️  [--] YouTube RSS: {exc}（ときどき起きます。タブで足りているので通知には影響しません）")
+    try:
+        public_page = yt.fetch_posts_page(member=False)
+    except YouTubeError as exc:
+        problems.append(f"YouTube 投稿タブ（ログアウト表示）: {exc}")
+        return None
+    print(f"✅ [OK] YouTube 投稿タブ（ログアウト表示）: {len(public_page.posts)} 件")
+    return public_page
+
+
 def _check(cfg: Config) -> int:
     """Log in through the gateway once (Discord requires this before a bot can post)
     and verify channel permissions, then check YouTube access."""
@@ -140,14 +179,7 @@ def _check(cfg: Config) -> int:
     from .notifier import classify_member_posts, comparable_public_page, member_page_problem
 
     yt = YouTubeClient.from_config(cfg)
-    public_page = None
-    try:
-        refs, title = yt.fetch_rss()
-        print(f"✅ [OK] YouTube RSS: {title} / {len(refs)} 件")
-        public_page = yt.fetch_posts_page(member=False)
-        print(f"✅ [OK] YouTube 投稿タブ（ログアウト表示）: {len(public_page.posts)} 件")
-    except YouTubeError as exc:
-        problems.append(f"YouTube: {exc}")
+    public_page = _check_sources(yt, problems)
     if cfg.firefox_profile:
         from .browser_refresh import read_status
         from .firefox_cookies import profile_in_use

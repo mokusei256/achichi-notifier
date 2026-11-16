@@ -53,6 +53,9 @@ class Notification:
 class CollectResult:
     notifications: list[Notification] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
+    # Source problems that left nothing uncovered: logged, but the run still counts as a success
+    # (so they never make the fallback take over or raise the "primary is down" alert).
+    tolerated: list[str] = field(default_factory=list)
     meta: ChannelMeta | None = None
     # Members-only check outcome. Cookie problems never count as errors: they must not
     # stop video/public-post notifications or make the fallback take over everything.
@@ -147,18 +150,28 @@ class Notifier:
 
     def collect_video_refs(self, result: CollectResult) -> list[VideoRef]:
         groups: list[list[VideoRef]] = []
+        rss_error = None
         try:
             refs, _ = self.yt.fetch_rss()
             groups.append(refs)
         except YouTubeError as exc:
-            result.errors.append(f"rss: {exc}")
+            rss_error = f"rss: {exc}"
+        covered = True  # every tab answered with a non-empty list
         for tab in VIDEO_TABS:
             try:
                 refs, meta = self.yt.fetch_tab(tab)
                 groups.append(refs)
                 result.meta = result.meta or meta
+                if not refs:
+                    covered = False  # an empty list proves nothing (layout change, odd variant)
             except YouTubeError as exc:
                 result.errors.append(f"{tab}: {exc}")
+                covered = False
+        if rss_error:
+            # The feed answers HTTP 404 now and then. The /videos, /shorts and /streams tabs
+            # list everything it does, so it only counts as an error when they did not all
+            # come back with videos.
+            (result.tolerated if covered else result.errors).append(rss_error)
         return _merge_refs(groups)
 
     def check_videos(self, state: State, result: CollectResult) -> None:
@@ -701,6 +714,8 @@ def run(cfg: Config, role: str = "primary", dry_run: bool = False) -> int:
     result = notifier.collect(state, mode)
     for error in result.errors:
         log.warning("source error: %s", error)
+    for problem in result.tolerated:
+        log.info("source error ignored (the channel tabs covered it): %s", problem)
 
     state.owner_role = role
     if role == "fallback" and mode == "full":
@@ -843,6 +858,8 @@ def preview(cfg: Config, send: bool = False, dest_name: str = dests.MAIN) -> int
         log.warning("members-only check: %s", result.member_status)
     for error in result.errors:
         log.warning("source error: %s", error)
+    for problem in result.tolerated:
+        log.info("source error ignored (the channel tabs covered it): %s", problem)
 
     if send:
         cfg.require_discord()

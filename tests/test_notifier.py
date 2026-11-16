@@ -31,6 +31,8 @@ class FakeYouTube:
     public_valid = True
     public_logged_in = False
     member_fails = False
+    rss_fails = False
+    failing_tabs: set = set()
     calls: list = []
 
     def __init__(self):
@@ -44,10 +46,14 @@ class FakeYouTube:
 
     def fetch_rss(self):
         FakeYouTube.calls.append("rss")
+        if self.rss_fails:
+            raise YouTubeError("GET /feeds/videos.xml -> HTTP 404")
         return [r for r in self.videos if "rss" in r.sources], "Mela Ch."
 
     def fetch_tab(self, tab):
         FakeYouTube.calls.append(tab)
+        if tab in self.failing_tabs:
+            raise YouTubeError(f"ytInitialData not found on /channel/UC/{tab}")
         return [r for r in self.videos if tab in r.sources], ChannelMeta("Mela Ch.", None, None)
 
     def fetch_video_info(self, ref):
@@ -95,6 +101,8 @@ def fake_youtube(monkeypatch):
     FakeYouTube.public_valid = True
     FakeYouTube.public_logged_in = False
     FakeYouTube.member_fails = False
+    FakeYouTube.rss_fails = False
+    FakeYouTube.failing_tabs = set()
     FakeYouTube.calls = []
     monkeypatch.setattr(notifier, "YouTubeClient", FakeYouTube)
 
@@ -619,3 +627,123 @@ def test_unexpected_errors_reach_the_log_file_without_a_console(tmp_path, monkey
     assert rc == 1
     text = log_path.read_text(encoding="utf-8")
     assert "unexpected error" in text and "Traceback" in text and "parser exploded" in text
+
+
+def _backdate_primary(tmp_path) -> str:
+    """Stamps are whole seconds: move the first run's into the past so a new one is visible."""
+    old = "2000-01-01T00:00:00+00:00"
+    state = _state(tmp_path)
+    state["runners"]["primary"].update({"last_success": old, "last_run": old})
+    _write_state(tmp_path, state)
+    return old
+
+
+def _every_tab_lists_something():
+    FakeYouTube.videos = [VideoRef("old00000001", {"rss", "videos"}, title="old"),
+                          VideoRef("oldshort001", {"rss", "shorts"}, title="old short"),
+                          VideoRef("oldlive0001", {"streams"}, title="old stream")]
+
+
+def test_rss_404_alone_still_counts_as_success(tmp_path, capsys, caplog):
+    """The feed 404s now and then; the channel tabs cover it, so the run is still a success."""
+    cfg = _cfg(tmp_path)
+    _every_tab_lists_something()
+    _run(cfg, capsys)  # seeds
+    old = _backdate_primary(tmp_path)
+    FakeYouTube.rss_fails = True
+    FakeYouTube.videos = [VideoRef("new00000001", {"videos"}, title="new"), *FakeYouTube.videos]
+    with caplog.at_level(logging.INFO, logger="achichi_notifier.notifier"):
+        rc, _, kinds = _run(cfg, capsys)
+    runner = _state(tmp_path)["runners"]["primary"]
+    assert rc == 0 and kinds == ["video"]
+    assert runner["last_success"] == runner["last_run"] != old
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING and "rss" in r.getMessage()]
+    assert any("ignored" in r.getMessage() and "HTTP 404" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.parametrize("rss_fails, failing_tabs", [(True, {"shorts"}), (False, {"streams"})])
+def test_tab_failure_is_still_an_error(tmp_path, capsys, caplog, rss_fails, failing_tabs):
+    cfg = _cfg(tmp_path)
+    _every_tab_lists_something()
+    _run(cfg, capsys)
+    old = _backdate_primary(tmp_path)
+    FakeYouTube.rss_fails, FakeYouTube.failing_tabs = rss_fails, failing_tabs
+    with caplog.at_level(logging.WARNING, logger="achichi_notifier.notifier"):
+        _run(cfg, capsys)
+    runner = _state(tmp_path)["runners"]["primary"]
+    assert runner["last_success"] == old and runner["last_run"] != old
+    warned = " ".join(r.getMessage() for r in caplog.records)
+    assert next(iter(failing_tabs)) in warned
+    assert ("rss" in warned) == rss_fails  # with a tab down, the feed's failure counts too
+
+
+def test_rss_404_with_an_empty_tab_is_an_error(tmp_path, capsys, caplog):
+    """A tab that parses to nothing (layout change) proves nothing, so the feed is still needed."""
+    cfg = _cfg(tmp_path)
+    _every_tab_lists_something()
+    _run(cfg, capsys)
+    old = _backdate_primary(tmp_path)
+    FakeYouTube.rss_fails = True
+    FakeYouTube.videos = [r for r in FakeYouTube.videos if "streams" not in r.sources]
+    with caplog.at_level(logging.WARNING, logger="achichi_notifier.notifier"):
+        _run(cfg, capsys)
+    assert _state(tmp_path)["runners"]["primary"]["last_success"] == old
+    assert any("rss" in r.getMessage() and r.levelno == logging.WARNING for r in caplog.records)
+
+
+def test_rss_404_keeps_the_fallback_idle(tmp_path, capsys):
+    cfg = _cfg(tmp_path)
+    _every_tab_lists_something()
+    _run(cfg, capsys)
+    _backdate_primary(tmp_path)
+    FakeYouTube.rss_fails = True
+    _run(cfg, capsys)  # primary: RSS 404 only
+    calls_before = len(FakeYouTube.calls)
+    _run(cfg, capsys, role="fallback")
+    assert "videos" not in FakeYouTube.calls[calls_before:]  # primary is fresh: no full run
+
+
+class _CheckYouTube:
+    def __init__(self, rss_fails=False, tabs=None, posts_fail=False):
+        self.rss_fails, self.posts_fail, self.calls = rss_fails, posts_fail, []
+        self.tabs = tabs if tabs is not None else {"videos": 1, "shorts": 1, "streams": 1}
+
+    def fetch_tab(self, tab):
+        self.calls.append(tab)
+        count = self.tabs.get(tab)
+        if count is None:
+            raise YouTubeError(f"ytInitialData not found on /channel/UC/{tab}")
+        return [VideoRef(f"{tab}{i}", {tab}) for i in range(count)], None
+
+    def fetch_rss(self):
+        self.calls.append("rss")
+        if self.rss_fails:
+            raise YouTubeError("GET /feeds/videos.xml -> HTTP 404")
+        return [], "Mela Ch."
+
+    def fetch_posts_page(self, member=False):
+        self.calls.append("posts")
+        if self.posts_fail:
+            raise YouTubeError("ytInitialData not found on /posts")
+        return PostsPage([Post("UgkxA", text="x")], False, None)
+
+
+@pytest.mark.parametrize("yt, ok", [
+    (_CheckYouTube(), True),
+    (_CheckYouTube(rss_fails=True), True),  # covered by the tabs: info line, not NG
+    (_CheckYouTube(rss_fails=True, tabs={"videos": 3, "shorts": 0, "streams": 2}), False),
+    (_CheckYouTube(rss_fails=True, tabs={"videos": 3, "streams": 2}), False),
+    (_CheckYouTube(tabs={"videos": 3, "streams": 2}), False),
+    (_CheckYouTube(posts_fail=True), False),
+])
+def test_check_judges_sources_like_a_run(yt, ok, capsys):
+    from achichi_notifier import __main__ as cli
+    problems: list[str] = []
+    page = cli._check_sources(yt, problems)
+    out = capsys.readouterr().out
+    assert (not problems) == ok, problems
+    assert "posts" in yt.calls  # never skipped because the feed failed
+    assert (page is None) == yt.posts_fail
+    if yt.rss_fails:  # NG exactly when a tab is down too; the harmless-info line only when covered
+        assert any(p.startswith("YouTube RSS:") for p in problems) == (not ok)
+        assert ("通知には影響しません" in out) == ok
