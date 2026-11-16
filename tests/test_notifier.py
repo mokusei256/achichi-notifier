@@ -430,11 +430,18 @@ class FakeDiscordClient:
     def recent_urls(self, channel_id, limit=50):
         return set(self.recent)
 
+    # Latest messages per channel (newest first); tests put 🛑 reactions here.
+    history: dict = {}
+
+    def messages(self, channel_id, limit=100, before=None):
+        return list(FakeDiscordClient.history.get(channel_id, []))[:limit]
+
 
 @pytest.fixture
 def wired(monkeypatch, tmp_path):
     """run() with a fake Discord client, Discord-style config and a local state file."""
     FakeDiscordClient.instances = []
+    FakeDiscordClient.history = {}
     monkeypatch.setattr(notifier, "DiscordClient", FakeDiscordClient)
     monkeypatch.setattr(notifier, "make_store", lambda cfg, discord: FileStateStore(tmp_path / "state.json"))
     return _cfg(tmp_path, discord_token="t", state_backend="discord", state_channel_id="999")

@@ -25,9 +25,12 @@ MAX_ENTRIES = 1500
 PENDING_TTL_HOURS = 72
 BACKLOG_PREFIX = "backlog@"  # pending entries recorded at the members-only comparison baseline
 KNOWN_KEYS = {"version", "videos", "posts", "seeded", "runners", "alerts", "pending",
-              "destinations", "destinations_updated", "undelivered"}
+              "destinations", "destinations_updated", "undelivered", "muted"}
 UNDELIVERED_KEEP_HOURS = 24
 LOST_REPORT_KEEP_DAYS = 7  # an unreported lost notification waits this long for the #管理 alert
+UNHANDLED_KEEP_DAYS = 30  # an undelivered entry no run has handled yet (bot stopped meanwhile)
+MUTED_KEEP_DAYS = 7  # notifications held back by the emergency stop stay listed this long
+MUTED_MAX_ENTRIES = 200
 
 
 def now_iso() -> str:
@@ -69,6 +72,9 @@ class State:
     # kind, first, tries, done, lost, reported}. Only these are retried, so channels that
     # already got the post never get it twice. lost = given up; reported = told #管理.
     undelivered: dict[str, dict] = field(default_factory=dict)
+    # Notifications not sent because the bot was stopped (see control.py; the stop switches
+    # themselves live in #管理, not here): url -> {kind, title, at, why}.
+    muted: dict[str, dict] = field(default_factory=dict)
     # Unknown top-level keys written by a newer version are carried through untouched,
     # so an older copy of the bot (e.g. on the Mac) never erases them.
     extra: dict = field(default_factory=dict)
@@ -90,6 +96,7 @@ class State:
             destinations_updated=data.get("destinations_updated"),
             undelivered={k: dict(v) for k, v in (data.get("undelivered") or {}).items()
                          if isinstance(v, dict)},
+            muted={k: dict(v) for k, v in (data.get("muted") or {}).items() if isinstance(v, dict)},
             extra={k: v for k, v in data.items() if k not in KNOWN_KEYS},
         )
 
@@ -106,6 +113,7 @@ class State:
             "destinations": self.destinations,
             "destinations_updated": self.destinations_updated,
             "undelivered": self.undelivered,
+            "muted": self.muted,
         }
 
     def merge_from(self, other: State) -> None:
@@ -141,6 +149,8 @@ class State:
             for stamp in ("done", "lost", "reported"):
                 mine[stamp] = _max_iso(mine.get(stamp), theirs.get(stamp))
             mine["tries"] = max(int(mine.get("tries") or 0), int(theirs.get("tries") or 0))
+        for key, value in other.muted.items():
+            self.muted.setdefault(key, dict(value))
         # A pending post that either side has since announced or seen publicly is settled.
         for key in [k for k in self.pending if k in self.posts]:
             del self.pending[key]
@@ -154,6 +164,11 @@ class State:
         now_ts = datetime.now(timezone.utc).timestamp()
 
         def keep_undelivered(entry: dict) -> bool:
+            if not entry.get("done") and not entry.get("lost"):
+                # Not handled yet (e.g. the bot was stopped for days): the next run that may send
+                # gives it up and reports it, so it is never dropped unreported.
+                t = parse_time(entry.get("first"))
+                return t is None or t.timestamp() >= now_ts - UNHANDLED_KEEP_DAYS * 86400
             if entry.get("lost") and not entry.get("reported"):
                 t = parse_time(entry.get("lost"))
                 return t is None or t.timestamp() >= now_ts - LOST_REPORT_KEEP_DAYS * 86400
@@ -162,6 +177,11 @@ class State:
 
         self.undelivered = {k: v for k, v in self.undelivered.items()
                             if isinstance(v, dict) and keep_undelivered(v)}
+        muted_cutoff = now_ts - MUTED_KEEP_DAYS * 86400
+        muted = sorted(((k, v) for k, v in self.muted.items() if isinstance(v, dict)
+                        and ((t := parse_time(v.get("at"))) is None or t.timestamp() >= muted_cutoff)),
+                       key=lambda kv: str(kv[1].get("at") or ""), reverse=True)
+        self.muted = dict(muted[:MUTED_MAX_ENTRIES])
         cutoff = datetime.now(timezone.utc).timestamp() - PENDING_TTL_HOURS * 3600
         self.pending = {k: v for k, v in self.pending.items()
                         if (t := parse_time(v.removeprefix(BACKLOG_PREFIX))) is None

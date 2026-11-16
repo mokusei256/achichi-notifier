@@ -44,6 +44,7 @@ def test_destinations_merge_newest_list_wins():
 @pytest.fixture
 def wired_dests(monkeypatch, tmp_path):
     FakeDiscordClient.instances = []
+    FakeDiscordClient.history = {}
     monkeypatch.setattr(notifier, "DiscordClient", FakeDiscordClient)
     monkeypatch.setattr(notifier, "make_store", lambda cfg, discord: FileStateStore(tmp_path / "state.json"))
     return _cfg(tmp_path, discord_token="t", state_backend="discord", state_channel_id="999",

@@ -400,6 +400,42 @@ uv run python -m achichi_notifier preview --send --dest bigserver # 見た目の
 - 追加の送り先だけが送れない場合は、主系の PC は「正常」のままです（Mac の予備系が代わりに動き出すことはありません）。
 - 大きなサーバーでメン限投稿のリンクを流したくない場合は、`--kinds` から `member_post` を外してください。
 
+## 緊急停止・Bot の投稿を消す
+
+> **先に Windows と Mac の両方を最新版にしてください**。古い版の PC は止める仕組みを知らないので、止めても送ります（`stop` / `status` で古い版の PC があれば警告が出ます）。
+
+### Bot を止める
+
+Bot がおかしな通知を送り続けるなど、すぐ止めたいとき:
+
+| | 止める | 再開する |
+|---|---|---|
+| **Mac のターミナル** | `uv run python -m achichi_notifier stop --reason "二重通知"`（`--reason` は任意のメモ） | `uv run python -m achichi_notifier resume` |
+| **スマホ** | #管理 の最近のメッセージ（直近 100 件のどれでも）に 🛑 のリアクションを付ける | 🛑 を外す（`stop` で止めた場合は #管理 の「⏸ Bot を止めています」を削除） |
+
+`uv run python -m achichi_notifier status` で、止まっているか・各 PC が止める仕組みに対応しているか・止めていた間に送らなかった通知（直近 7 日）を確認できます。
+
+- `stop` は #管理 に「⏸ Bot を止めています」を書き込みます。Windows（主系）も Mac（予備系）も、送る直前に毎回 #管理 を見て、このメッセージか 🛑 があれば **Discord に何も送りません**（通知・送り直し・#管理 への警告もすべて）。止めてから最初の確認（主系は 5 分ごと）で止まります。その瞬間に送信中の回は止まりません。
+- 止めている間も YouTube の確認は続け、見つかった新着は「通知済み」として記録します。**再開しても送りません**（何時間も前の「配信が始まりました」が後から届くのを防ぐため）。`resume` と `status` に一覧が出るので、必要なら手動で共有してください。送り直し待ちの通知も止めている間は送らず、最初の失敗から 2 時間を過ぎていれば打ち切って #管理 に知らせます。
+- 一部の送り先だけ止めたいときは `dest disable 名前` を使います。
+- それでも止まらないとき（最終手段）: Discord で Bot の送信権限を外すかサーバーからキックする、または Developer Portal で Bot のトークンをリセットします（リセットした場合は両方の PC の `.env` のトークンを差し替えるまで動きません）。
+
+### Bot の投稿を消す
+
+Bot が自分で送ったメッセージだけを消します（人や他の Bot の投稿は消しません。Bot に「メッセージの管理」権限は要りません）。#管理 と状態ファイルのメッセージは対象外です。
+
+```bash
+uv run python -m achichi_notifier delete --since 1h                # 直近 1 時間の Bot の投稿を一覧（まだ消さない）
+uv run python -m achichi_notifier delete --url 'https://www.youtube.com/watch?v=XXXXXXXXXXX'  # その動画の通知を一覧
+uv run python -m achichi_notifier delete --last 3 --dest bigserver  # その送り先の新しい 3 件を一覧
+```
+
+- **`--yes` を付けない限り、一覧を表示するだけ**です。一覧の最後に「この一覧のメッセージだけを消すコマンド」（`--ids=… --yes` 付き）が出るので、それを実行すると消えます。一覧に出ていないメッセージ（そのあとに Bot が送った分など）は消しません。
+- 範囲は `--since`（`30m`・`2h`・`1d`）・`--last`（条件に合うものの新しい順に N 件。複数のチャンネルをまとめて数えます）・`--url`（動画・投稿の URL か ID）のどれかが必須です。組み合わせると、`--since` と `--url` の両方に合うものの中から `--last` 件、のように絞り込みます。
+- `--dest` も `--channel` も省くと、すべての送り先（停止中の送り先も含む）が対象です。`dest remove` した送り先のチャンネルは `--channel チャンネルID` で指定します（`--channel` だけを付けると、そのチャンネルだけが対象）。各チャンネルの直近 1000 件まで見ます。
+- 本物の通知を消すと、そのチャンネルへの送り直し待ちも取り消します。確実にするには、先に `stop` してから消してください（動いている最中の確認が、取り消す前に送り直すことがあるため）。
+- URL に `?` が入るので、zsh では `'...'` で囲んでください。
+
 ## コマンド一覧
 
 | コマンド | 内容 |
@@ -408,8 +444,10 @@ uv run python -m achichi_notifier preview --send --dest bigserver # 見た目の
 | `run --role fallback` | 主系が `FALLBACK_AFTER_MINUTES` 以上止まっているときは全体を確認。Cookie があれば `MEMBER_CHECK_MINUTES` ごとにメン限投稿を確認（Mac 用） |
 | `run --dry-run --state-file /tmp/achichi-test-state.json` | 投稿せずに表示するだけ。状態はリポジトリの外の一時ファイルに保存し、Discord の状態には触れない |
 | `preview [--send]` | 種類ごとの最新 1 件を通知の見た目で表示／送信（配信は立っている枠・配信中のみ、フリーチャットなどは除く。メンションなしで送信。古い版の Bot が動いている間は送らない） |
-| `check` | ゲートウェイログイン・権限（追加した送り先も含む）・YouTube・Cookie を確認 |
+| `check` | ゲートウェイログイン・権限（追加した送り先も含む）・YouTube・Cookie を確認（止めている間はその旨も表示） |
 | `dest list/add/remove/enable/disable/check` | 通知の送り先を管理（[上記](#別のサーバーにも通知する送り先の追加)） |
+| `stop [--reason メモ]` / `resume` / `status` | 緊急停止・再開・止まっているかの確認（[上記](#緊急停止bot-の投稿を消す)。スマホからは #管理 に 🛑） |
+| `delete --since 1h` など | Bot 自身の投稿を一覧（`--last N` `--url URL` `--dest 名前` `--channel ID`）。一覧の最後に出る `--until … --yes` 付きのコマンドで削除 |
 
 すべて `uv run python -m achichi_notifier <コマンド>` の形で実行します。
 

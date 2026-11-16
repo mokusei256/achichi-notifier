@@ -90,6 +90,11 @@ class DiscordClient:
     def edit_message(self, channel_id: str, message_id: str, payload: dict) -> dict:
         return self._request("PATCH", f"/channels/{channel_id}/messages/{message_id}", json=payload)
 
+    def delete_message(self, channel_id: str, message_id: str) -> None:
+        """Deleting the bot's own messages needs no extra permission (others' would need
+        Manage Messages, which this bot is not given)."""
+        self._request("DELETE", f"/channels/{channel_id}/messages/{message_id}")
+
     def get_message(self, channel_id: str, message_id: str) -> dict:
         return self._request("GET", f"/channels/{channel_id}/messages/{message_id}")
 

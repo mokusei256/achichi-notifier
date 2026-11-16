@@ -12,6 +12,7 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from functools import lru_cache
 
+from . import control
 from . import destinations as dests
 from . import render
 from .config import Config, ConfigError
@@ -25,7 +26,7 @@ from .youtube import (
 log = logging.getLogger(__name__)
 
 ROLES = ("primary", "fallback")
-FEATURES = ("destinations", "preview_mark")
+FEATURES = ("destinations", "preview_mark", "pause")
 COOKIE_ALERT_INTERVAL = timedelta(hours=24)
 # Consecutive failed members-only checks before the state channel is told (~30 min on the
 # Windows primary, ~1h on the Mac). Covers temporary page problems and Firefox-profile reads
@@ -636,9 +637,11 @@ def _retry_undelivered(state: State, discord: DiscordClient, recent, targets_all
         if now - first > timedelta(hours=UNDELIVERED_RETRY_HOURS):
             tries = int(entry.get("tries") or 1)
             entry["done"] = entry["lost"] = now_iso()  # reported by _lost_alert
+            held = int(entry.get("held") or 0)
             entry["why"] = (f"最初の失敗から {UNDELIVERED_RETRY_HOURS} 時間を過ぎました。"
                             f"送信を試したのは {tries} 回"
-                            + ("（PC が止まっていた可能性があります）" if tries <= 2 else ""))
+                            + (f"（Bot を止めていた間の {held} 回は送り直していません）" if held
+                               else "（PC が止まっていた可能性があります）" if tries <= 2 else ""))
             continue
         try:
             discord.send(channel, render.apply_mention(payload, mention))
@@ -769,10 +772,22 @@ def run(cfg: Config, role: str = "primary", dry_run: bool = False) -> int:
     for problem in result.tolerated:
         log.info("source error ignored (the channel tabs covered it): %s", problem)
 
+    # Emergency stop (`stop` marker or a 🛑 reaction in #管理, read live): YouTube was checked
+    # and the state is kept as usual, but nothing at all is sent. Read after the (slow) YouTube
+    # fetch so a stop made meanwhile still counts. `sender` is None while stopped.
+    stopped = None if dry_run else control.pause_reason(cfg, discord)
+    if stopped:
+        log.warning("stopped (%s): nothing is sent to Discord this run", stopped)
+    sender = None if stopped else discord
+
     state.owner_role = role
     if role == "fallback" and mode == "full":
-        _primary_down_alert(cfg, discord, state, now, dry_run)
+        _primary_down_alert(cfg, sender, state, now, dry_run)
     runner = state.runners.setdefault(role, {})
+    if stopped:
+        for entry in state.undelivered.values():
+            if not entry.get("done"):
+                entry["held"] = int(entry.get("held") or 0) + 1  # a retry skipped: said when given up
     if result.member_status is not None:
         runner["last_member_check"] = now_iso()
         if result.member_status == "ok":
@@ -781,15 +796,15 @@ def run(cfg: Config, role: str = "primary", dry_run: bool = False) -> int:
             runner["member_fail_streak"] = int(runner.get("member_fail_streak") or 0) + 1
         else:
             runner["member_fail_streak"] = 0
-        _cookie_alert(cfg, discord, state, role, result.member_status, result.member_detail,
+        _cookie_alert(cfg, sender, state, role, result.member_status, result.member_detail,
                       dry_run, streak=int(runner.get("member_fail_streak") or 0),
                       source=result.cookie_source)
     if cfg.firefox_profile and not dry_run:
-        _browser_refresh_alert(cfg, discord, state, role)
+        _browser_refresh_alert(cfg, sender, state, role)
 
     targets_all = dests.resolve(cfg, state)
-    recent = _RecentlyPosted(discord) if discord is not None and not dry_run else None
-    send_failures = skipped = delivered_total = 0
+    recent = _RecentlyPosted(sender) if sender is not None and not dry_run else None
+    send_failures = skipped = delivered_total = muted_total = 0
     failed_destinations: dict[tuple[str, str], list[tuple[str, str | None]]] = {}
 
     def record_failure(name: str, category: str, detail: str, url: str | None) -> None:
@@ -797,10 +812,22 @@ def run(cfg: Config, role: str = "primary", dry_run: bool = False) -> int:
         "everywhere" (reached no destination: the whole item is tried again next run)."""
         failed_destinations.setdefault((name, category), []).append((detail, url))
 
-    if not dry_run and discord is not None:
-        delivered_total += _retry_undelivered(state, discord, recent, targets_all)
+    if not dry_run and sender is not None:
+        delivered_total += _retry_undelivered(state, sender, recent, targets_all)
     for note in result.notifications:
         targets = _targets_by_channel(targets_all, note.kind)
+        if stopped:
+            if targets:  # would have gone out: list it for `resume`, never send it later
+                muted_total += 1
+                embed = (note.payload.get("embeds") or [{}])[0]
+                state.muted[note.url or f"{note.item_type}:{note.item_id}"] = {
+                    "kind": note.kind, "title": str(embed.get("title") or "")[:120], "at": now_iso(),
+                    "why": stopped,
+                }
+                log.warning("stopped: did not send the %s notification %s", note.kind, note.item_id)
+            (state.videos if note.item_type == "video" else state.posts)[note.item_id] = now_iso()
+            state.pending.pop(note.item_id, None)
+            continue
         sent_or_present = 0
         temporary: list[tuple[str, str, dict, DiscordError]] = []
         for channel, (dest, mention) in targets.items():
@@ -815,7 +842,7 @@ def run(cfg: Config, role: str = "primary", dry_run: bool = False) -> int:
                 log.info("this bot already posted that %s notification to %s", note.kind, dest.name)
             else:
                 try:
-                    discord.send(channel, payload)
+                    sender.send(channel, payload)
                     sent_or_present += 1
                     delivered_total += 1
                     if recent is not None:
@@ -847,9 +874,9 @@ def run(cfg: Config, role: str = "primary", dry_run: bool = False) -> int:
             log.info("%s %s %s -> %d destination(s)", "would notify" if dry_run else "notified",
                      note.kind, note.item_id, sent_or_present)
     if failed_destinations and not dry_run:
-        _destination_alert(cfg, discord, state, failed_destinations)
+        _destination_alert(cfg, sender, state, failed_destinations)
     if not dry_run:
-        _lost_alert(cfg, discord, state)
+        _lost_alert(cfg, sender, state)
 
     runner["last_run"] = now_iso()
     runner["host"] = "github-actions" if _in_github() else "local"
@@ -865,8 +892,9 @@ def run(cfg: Config, role: str = "primary", dry_run: bool = False) -> int:
         log.info("dry-run (%s): %d notification(s) printed, nothing posted", mode, len(result.notifications))
         return 0
     store.save(state)
-    log.info("done (%s): %d message(s) sent, %d already posted, %d source error(s), %d undelivered", mode,
-             delivered_total, skipped, len(result.errors), send_failures)
+    log.info("done (%s): %d message(s) sent, %d already posted, %d source error(s), %d undelivered%s", mode,
+             delivered_total, skipped, len(result.errors), send_failures,
+             f", stopped: {muted_total} held back" if stopped else "")
     return 1 if send_failures else 0
 
 
@@ -946,6 +974,10 @@ def preview(cfg: Config, send: bool = False, dest_name: str = dests.MAIN, force:
                   "古い版はプレビューを本物の通知と見分けられず、本物の通知を送らなくなることがあります。"
                   "Windows は git pull → install.ps1、Mac は ./deploy/mac/install.sh で更新してから、"
                   "もう一度実行してください（それでも送るときは --force）。")
+            return 2
+        stopped = control.pause_reason(cfg, discord)
+        if stopped:
+            print(f"⏸ Bot を止めているため（{stopped}）、プレビューを送りませんでした。{control.RESUME_HINT}。")
             return 2
         dest = targets[0]
         for note in notes:

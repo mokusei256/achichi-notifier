@@ -206,6 +206,13 @@ def cmd_check(cfg: Config, name: str, send_test: bool) -> int:
         print(f"送り先「{name}」はありません。")
         return 1
     dest, problems = found[0], 0
+    if send_test:
+        from .control import RESUME_HINT, pause_reason
+        stopped = pause_reason(cfg, discord)
+        if stopped:
+            print(f"⏸ Bot を止めているため（{stopped}）、テスト送信はしません（権限の確認だけします）。{RESUME_HINT}。")
+            send_test = False
+            problems += 1
     for channel_id in dest.all_channels():
         try:
             print(f"✅ [OK] {channel_id} -> {_describe_channel(discord, channel_id)}")

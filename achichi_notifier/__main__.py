@@ -3,6 +3,8 @@
     python -m achichi_notifier run [--role primary|fallback] [--dry-run]
     python -m achichi_notifier preview [--send]
     python -m achichi_notifier check
+    python -m achichi_notifier stop | resume | status
+    python -m achichi_notifier delete --since 1h [--yes]
 """
 
 from __future__ import annotations
@@ -137,8 +139,13 @@ def _check(cfg: Config) -> int:
     from . import destinations as dests
     from .notifier import make_store
     try:
-        state = make_store(cfg, DiscordClient(cfg.discord_token)).load()
+        rest = DiscordClient(cfg.discord_token)
+        state = make_store(cfg, rest).load()
         extra_destinations = [d for d in dests.resolve(cfg, state) if d.name != dests.MAIN and d.enabled]
+        from .control import RESUME_HINT, pause_reason
+        stopped = pause_reason(cfg, rest)
+        if stopped:
+            print(f"⏸ [!!] Bot を止めています（{stopped}）。Discord には何も送りません。{RESUME_HINT}。")
     except DiscordError as exc:
         problems.append(f"共有の状態を読めません: {exc}")
         extra_destinations = []
@@ -263,6 +270,22 @@ def main(argv: list[str] | None = None) -> int:
     p_ref.add_argument("--dwell", type=float, help="seconds to keep the page open (default FIREFOX_REFRESH_SECONDS)")
     p_ref.add_argument("--url", default="https://www.youtube.com/")
 
+    p_stop = sub.add_parser("stop", help="emergency stop: posts a marker in #管理; every runner then "
+                                          "sends nothing from its next run")
+    p_stop.add_argument("--reason", help="a note written into the marker")
+    sub.add_parser("resume", help="delete the stop marker (a 🛑 reaction in #管理 must be removed by hand)")
+    sub.add_parser("status", help="show whether the bot is stopped and what it held back")
+    p_del = sub.add_parser("delete", help="delete the bot's own messages in the destination channels "
+                                          "(lists them unless --yes)")
+    p_del.add_argument("--since", help="messages from this long ago, e.g. 30m, 2h, 1d")
+    p_del.add_argument("--last", type=int, help="the newest N matching bot messages (across the channels)")
+    p_del.add_argument("--url", help="messages about this YouTube video/post (URL or id)")
+    p_del.add_argument("--dest", action="append", help="only this destination (repeatable; default: all)")
+    p_del.add_argument("--channel", action="append",
+                       help="a channel id, e.g. of a removed destination (repeatable; #管理 is never touched)")
+    p_del.add_argument("--ids", help="only these message ids, comma-separated (the list prints the command)")
+    p_del.add_argument("--yes", action="store_true", help="really delete (otherwise only list)")
+
     p_dest = sub.add_parser("dest", help="manage notification destinations (other Discord servers)")
     dsub = p_dest.add_subparsers(dest="dest_command", required=True)
     dsub.add_parser("list", help="show all destinations")
@@ -323,6 +346,17 @@ def main(argv: list[str] | None = None) -> int:
                 return dest_cli.cmd_check(cfg, args.name, args.send_test)
         if args.command == "check":
             return _check(cfg)
+        if args.command in ("stop", "resume", "status", "delete"):
+            from . import control_cli
+            if args.command == "stop":
+                return control_cli.cmd_stop(cfg, args.reason)
+            if args.command == "resume":
+                return control_cli.cmd_resume(cfg)
+            if args.command == "status":
+                return control_cli.cmd_status(cfg)
+            return control_cli.cmd_delete(cfg, since=args.since, last=args.last, url=args.url,
+                                          dest_names=args.dest, yes=args.yes,
+                                          channel_ids=args.channel, ids=args.ids)
     except ConfigError as exc:
         logging.getLogger("achichi_notifier").error("config error: %s", exc)
         return 2
