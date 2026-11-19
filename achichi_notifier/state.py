@@ -25,12 +25,14 @@ MAX_ENTRIES = 1500
 PENDING_TTL_HOURS = 72
 BACKLOG_PREFIX = "backlog@"  # pending entries recorded at the members-only comparison baseline
 KNOWN_KEYS = {"version", "videos", "posts", "seeded", "runners", "alerts", "pending",
-              "destinations", "destinations_updated", "undelivered", "muted"}
+              "destinations", "destinations_updated", "undelivered", "muted", "live"}
 UNDELIVERED_KEEP_HOURS = 24
 LOST_REPORT_KEEP_DAYS = 7  # an unreported lost notification waits this long for the #管理 alert
 UNHANDLED_KEEP_DAYS = 30  # an undelivered entry no run has handled yet (bot stopped meanwhile)
 MUTED_KEEP_DAYS = 7  # notifications held back by the emergency stop stay listed this long
 MUTED_MAX_ENTRIES = 200
+LIVE_KEEP_DAYS = 30  # stream start tracking entries (see Notifier.check_live_starts)
+LIVE_MAX_ENTRIES = 300
 
 
 def now_iso() -> str:
@@ -51,6 +53,11 @@ def _max_iso(a: str | None, b: str | None) -> str | None:
         return a or b
     return a if (parse_time(a) or datetime.min.replace(tzinfo=timezone.utc)) >= (
         parse_time(b) or datetime.min.replace(tzinfo=timezone.utc)) else b
+
+
+def _live_rank(entry: dict) -> int:
+    done = entry.get("done")
+    return 0 if not done else 1 if done == "stale" else 2
 
 
 @dataclass
@@ -75,6 +82,10 @@ class State:
     # Notifications not sent because the bot was stopped (see control.py; the stop switches
     # themselves live in #管理, not here): url -> {kind, title, at, why}.
     muted: dict[str, dict] = field(default_factory=dict)
+    # Streams whose start is watched for (see Notifier.check_live_starts): video_id ->
+    # {scheduled: start time or None, done: None while waiting, else why it is settled
+    # ("started" = start announced or held back, "ended", "excluded", "stale", "not_live"), at}.
+    live: dict[str, dict] = field(default_factory=dict)
     # Unknown top-level keys written by a newer version are carried through untouched,
     # so an older copy of the bot (e.g. on the Mac) never erases them.
     extra: dict = field(default_factory=dict)
@@ -97,6 +108,7 @@ class State:
             undelivered={k: dict(v) for k, v in (data.get("undelivered") or {}).items()
                          if isinstance(v, dict)},
             muted={k: dict(v) for k, v in (data.get("muted") or {}).items() if isinstance(v, dict)},
+            live={k: dict(v) for k, v in (data.get("live") or {}).items() if isinstance(v, dict)},
             extra={k: v for k, v in data.items() if k not in KNOWN_KEYS},
         )
 
@@ -114,6 +126,7 @@ class State:
             "destinations_updated": self.destinations_updated,
             "undelivered": self.undelivered,
             "muted": self.muted,
+            "live": self.live,
         }
 
     def merge_from(self, other: State) -> None:
@@ -151,6 +164,12 @@ class State:
             mine["tries"] = max(int(mine.get("tries") or 0), int(theirs.get("tries") or 0))
         for key, value in other.muted.items():
             self.muted.setdefault(key, dict(value))
+        for key, theirs in other.live.items():
+            mine = self.live.get(key)
+            # Settled on either side stays settled, so a start is never announced twice.
+            # "stale" (gave up waiting) can still turn into "started", so it ranks lower.
+            if mine is None or _live_rank(theirs) > _live_rank(mine):
+                self.live[key] = dict(theirs)
         # A pending post that either side has since announced or seen publicly is settled.
         for key in [k for k in self.pending if k in self.posts]:
             del self.pending[key]
@@ -182,6 +201,11 @@ class State:
                         and ((t := parse_time(v.get("at"))) is None or t.timestamp() >= muted_cutoff)),
                        key=lambda kv: str(kv[1].get("at") or ""), reverse=True)
         self.muted = dict(muted[:MUTED_MAX_ENTRIES])
+        live_cutoff = now_ts - LIVE_KEEP_DAYS * 86400
+        live = sorted(((k, v) for k, v in self.live.items() if isinstance(v, dict)
+                       and ((t := parse_time(v.get("at"))) is None or t.timestamp() >= live_cutoff)),
+                      key=lambda kv: str(kv[1].get("at") or ""), reverse=True)
+        self.live = dict(live[:LIVE_MAX_ENTRIES])
         cutoff = datetime.now(timezone.utc).timestamp() - PENDING_TTL_HOURS * 3600
         self.pending = {k: v for k, v in self.pending.items()
                         if (t := parse_time(v.removeprefix(BACKLOG_PREFIX))) is None

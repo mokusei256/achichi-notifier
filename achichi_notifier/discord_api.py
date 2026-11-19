@@ -104,11 +104,12 @@ class DiscordClient:
             params["before"] = before
         return self._request("GET", f"/channels/{channel_id}/messages", params=params)
 
-    def recent_urls(self, channel_id: str, limit: int = 50) -> set[str]:
-        """Embed links of this bot's own recent notifications in the channel. Links posted
-        by people or other bots, and the bot's previews (see is_preview), are ignored."""
+    def recent_notices(self, channel_id: str, limit: int = 50) -> list[tuple[str, str]]:
+        """(embed link, message text) of this bot's own recent notifications in the channel.
+        Links posted by people or other bots, and the bot's previews (see is_preview), are
+        ignored. The text tells a stream's start notice from its slot notice (same link)."""
         bot_id = self.me()["id"]
-        urls: set[str] = set()
+        notices: list[tuple[str, str]] = []
         for message in self.messages(channel_id, limit=limit):
             if message.get("author", {}).get("id") != bot_id:
                 continue
@@ -116,8 +117,11 @@ class DiscordClient:
                 continue
             for embed in message.get("embeds") or []:
                 if embed.get("url"):
-                    urls.add(embed["url"])
-        return urls
+                    notices.append((embed["url"], message.get("content") or ""))
+        return notices
+
+    def recent_urls(self, channel_id: str, limit: int = 50) -> set[str]:
+        return {url for url, _ in self.recent_notices(channel_id, limit=limit)}
 
     def _file_parts(self, content: str, filename: str, data: bytes) -> dict:
         payload = {

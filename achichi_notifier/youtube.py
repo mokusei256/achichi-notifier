@@ -86,6 +86,7 @@ class VideoInfo:
     scheduled_start: datetime | None = None
     from_watch_page: bool = True
     ended: datetime | None = None  # live_archive: when the broadcast ended
+    started: datetime | None = None  # live_now / live_archive: when the broadcast actually began
 
 
 @dataclass
@@ -406,6 +407,8 @@ def classify_video(player: dict | None, ref: VideoRef) -> VideoInfo:
         scheduled_start=scheduled,
         from_watch_page=usable,
         ended=_parse_iso(broadcast.get("endTimestamp")) if kind == "live_archive" else None,
+        started=(_parse_iso(broadcast.get("startTimestamp"))
+                 if kind in ("live_now", "live_archive") else None),
     )
 
 

@@ -499,6 +499,10 @@ class FakeDiscordClient:
     def recent_urls(self, channel_id, limit=50):
         return set(self.recent)
 
+    def recent_notices(self, channel_id, limit=50):
+        # Subclasses that only override recent_urls keep working (texts are then unknown).
+        return [(url, "") for url in self.recent_urls(channel_id, limit)]
+
     # Latest messages per channel (newest first); tests put 🛑 reactions here.
     history: dict = {}
 

@@ -75,8 +75,10 @@ def video_payload(info: VideoInfo, meta: ChannelMeta | None, mention: str | None
     }
     if author := _author(meta):
         embed["author"] = author
-    if info.published:
-        embed["timestamp"] = info.published.isoformat()
+    # A stream that is on air shows when it began (its publish date is when the slot was made).
+    stamp = info.started if kind == "live_now" and info.started else info.published
+    if stamp:
+        embed["timestamp"] = stamp.isoformat()
     fields = []
     if info.scheduled_start and kind in ("live_upcoming", "premiere"):
         fields.append({"name": "開始予定", "value": _discord_time(info.scheduled_start), "inline": False})

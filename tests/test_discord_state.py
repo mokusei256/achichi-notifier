@@ -100,3 +100,6 @@ def test_recent_urls_only_counts_this_bots_real_notifications():
             ]
 
     assert Client().recent_urls("1") == {"https://www.youtube.com/watch?v=REALNOTE001"}
+    # The text comes along: a stream's start notice shares its link with the slot notice.
+    assert Client().recent_notices("1") == [("https://www.youtube.com/watch?v=REALNOTE001",
+                                             "📅 配信枠が作成されました")]

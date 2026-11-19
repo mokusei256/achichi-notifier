@@ -26,7 +26,7 @@ from .youtube import (
 log = logging.getLogger(__name__)
 
 ROLES = ("primary", "fallback")
-FEATURES = ("destinations", "preview_mark", "pause")
+FEATURES = ("destinations", "preview_mark", "pause", "live_start")
 COOKIE_ALERT_INTERVAL = timedelta(hours=24)
 # Consecutive failed members-only checks before the state channel is told (~30 min on the
 # Windows primary, ~1h on the Mac). Covers temporary page problems and Firefox-profile reads
@@ -34,12 +34,20 @@ COOKIE_ALERT_INTERVAL = timedelta(hours=24)
 FETCH_FAIL_ALERT_STREAK = 6
 STREAK_STATUSES = ("fetch_failed", "read_failed")
 BROWSER_REFRESH_ALERT_FAILURES = 3
+# Stream start notices (Notifier.check_live_starts). A tracked slot's watch page is checked
+# every run from LIVE_START_LEAD before its start time; if the stream has not begun
+# LIVE_WAIT after it, only a "live" badge on the channel tab makes the bot look again.
+LIVE_START_LEAD = timedelta(minutes=10)
+LIVE_WAIT = timedelta(hours=12)
+LIVE_CHECKS_PER_RUN = 5
+LIVE_FINAL = ("started", "ended", "excluded", "not_live")
+START_HEADLINE = render.HEADLINES["live_now"]
 
 
 @dataclass
 class Notification:
     kind: str  # key of render.HEADLINES
-    item_type: str  # "video" | "post"
+    item_type: str  # "video" | "post" | "live_start" (a slot announced earlier went on air)
     item_id: str
     sort_key: datetime
     payload: dict
@@ -150,6 +158,32 @@ def excluded_stream(cfg: Config, kind: str, title: str | None) -> bool:
     return bool(pattern.search(title) or pattern.search(unicodedata.normalize("NFKC", title)))
 
 
+def _wait_live(state: State, video_id: str, scheduled: datetime | None) -> None:
+    state.live[video_id] = {"scheduled": scheduled.isoformat() if scheduled else None,
+                            "done": None, "at": now_iso()}
+
+
+def _settle_live(state: State, video_id: str, why: str) -> None:
+    state.live[video_id] = {**state.live.get(video_id, {}), "done": why, "at": now_iso()}
+
+
+def _mark_handled(state: State, note: Notification) -> None:
+    """The item is announced (or deliberately not): never queue it again."""
+    if note.item_type == "live_start":
+        _settle_live(state, note.item_id, "started")
+        return
+    (state.videos if note.item_type == "video" else state.posts)[note.item_id] = now_iso()
+    state.pending.pop(note.item_id, None)
+
+
+def _guard_headline(kind: str | None) -> str | None:
+    """A "stream started" notice shares its link with the slot notice, so the "already
+    posted?" check also looks for its headline (also for a stream first seen on air: its slot
+    notice may have reached Discord although the send looked failed). Everything else is
+    matched by link alone."""
+    return START_HEADLINE if kind == "live_now" else None
+
+
 def _merge_refs(groups: list[list[VideoRef]]) -> list[VideoRef]:
     merged: dict[str, VideoRef] = {}
     for refs in groups:
@@ -217,6 +251,9 @@ class Notifier:
         if "videos" not in state.seeded:
             for ref in refs:
                 state.videos.setdefault(ref.video_id, now_iso())
+                if ref.live_hint == "live":  # on air before the bot knew the channel
+                    state.live.setdefault(ref.video_id, {"scheduled": None, "done": "started",
+                                                         "at": now_iso()})
             state.seeded["videos"] = now_iso()
             log.info("initial run: marked %d existing videos as seen (no notifications)", len(refs))
             return
@@ -230,12 +267,15 @@ class Notifier:
                 log.info("stream %s is excluded by EXCLUDE_LIVE_TITLES (%s); marking seen without notifying",
                          ref.video_id, info.title)
                 state.videos[ref.video_id] = now_iso()
+                _settle_live(state, ref.video_id, "excluded")
                 continue
             news_time = self.news_time(info)
             if news_time and self.now - news_time > self.max_age:
                 log.info("%s %s is old (%s); marking seen without notifying",
                          info.kind, ref.video_id, news_time.date())
                 state.videos[ref.video_id] = now_iso()
+                if render.GROUPS.get(info.kind) == "live":
+                    _settle_live(state, ref.video_id, "ended" if info.kind == "live_archive" else "stale")
                 continue
             log.info("new video %s kind=%s members_only=%s", ref.video_id, info.kind, info.members_only)
             result.queue(Notification(
@@ -245,6 +285,81 @@ class Notifier:
                 sort_key=info.published or self.now,
                 payload=render.video_payload(info, result.meta, None),  # mentions are per destination
             ))
+            if info.kind == "live_upcoming":
+                _wait_live(state, ref.video_id, info.scheduled_start)  # announce its start later
+            elif info.kind == "live_now":
+                _settle_live(state, ref.video_id, "started")  # this notice already says it is on air
+        self.check_live_starts(state, refs, result)
+
+    def check_live_starts(self, state: State, refs: list[VideoRef], result: CollectResult) -> None:
+        """Announce a stream when it goes on air, also when its slot was announced earlier
+        (the first sighting gives one notice per video id; this is the second one).
+
+        Looked at again (on its watch page, which is what decides): a seen stream the channel
+        tab marks as live, and a tracked slot from LIVE_START_LEAD before its start time on, so
+        a missing tab badge never loses the start. A stream found already over gets nothing."""
+        checks = 0
+        for ref in refs:
+            video_id = ref.video_id
+            if video_id not in state.videos:
+                continue  # new this run: check_videos announces it (or it waits for a retry)
+            entry = state.live.get(video_id) or {}
+            done = entry.get("done")
+            if done in LIVE_FINAL:
+                continue
+            if ref.live_hint == "live":
+                pass  # the tab says it is on air
+            elif done:
+                continue  # stale (never began): only a live badge brings it back
+            elif not entry or not entry.get("scheduled"):
+                # Start time unknown: a slot seen before start tracking existed, or one whose
+                # watch page could not be read. Learn it (again every LIVE_START_LEAD at most).
+                last = parse_time(entry.get("at"))
+                if ref.live_hint != "upcoming" or (last and self.now - last < LIVE_START_LEAD):
+                    continue
+            else:
+                scheduled = parse_time(entry.get("scheduled"))
+                if scheduled is None or self.now < scheduled - LIVE_START_LEAD:
+                    continue
+            if excluded_stream(self.cfg, "live_now", ref.title):
+                _settle_live(state, video_id, "excluded")
+                continue
+            if checks >= LIVE_CHECKS_PER_RUN:
+                log.info("more than %d streams to check for a start; the rest wait for the next run",
+                         LIVE_CHECKS_PER_RUN)
+                break
+            checks += 1
+            self._live_status(state, result, ref, self.yt.fetch_video_info(ref))
+
+    def _live_status(self, state: State, result: CollectResult, ref: VideoRef, info: VideoInfo) -> None:
+        video_id = ref.video_id
+        if excluded_stream(self.cfg, info.kind, info.title):
+            _settle_live(state, video_id, "excluded")
+        elif info.kind == "live_now":
+            # Due every run from now on, in case this notice cannot be sent this time; run()
+            # settles it once it is sent (or held back by the emergency stop).
+            _wait_live(state, video_id, info.started or self.now)
+            log.info("stream %s is on air; announcing its start", video_id)
+            result.queue(Notification(
+                kind="live_now", item_type="live_start", item_id=video_id,
+                sort_key=info.started or self.now,
+                payload=render.video_payload(info, result.meta, None),
+            ))
+        elif not info.from_watch_page:
+            pass  # the watch page could not be read: nothing learned, look again next run
+        elif info.kind == "live_upcoming":
+            scheduled = info.scheduled_start or parse_time((state.live.get(video_id) or {}).get("scheduled"))
+            if scheduled and self.now - scheduled > LIVE_WAIT:
+                log.info("stream %s has not begun %s after its start time; no longer checked",
+                         video_id, LIVE_WAIT)
+                _settle_live(state, video_id, "stale")
+            else:
+                _wait_live(state, video_id, scheduled)
+        elif info.kind == "live_archive":
+            log.info("stream %s was already over when checked; no start notice", video_id)
+            _settle_live(state, video_id, "ended")
+        else:
+            _settle_live(state, video_id, "not_live")
 
     # ------------------------------------------------------------------ posts
 
@@ -643,7 +758,8 @@ def _retry_undelivered(state: State, discord: DiscordClient, recent, targets_all
             continue
         dest, mention = current
         entry["dest"] = dest.name  # who takes this channel now (for the #管理 report)
-        if recent is not None and recent.contains(channel, url):
+        headline = _guard_headline(kind)
+        if recent is not None and recent.contains(channel, url, headline):
             entry["done"] = now_iso()  # an earlier try did reach Discord after all
             continue
         first = parse_time(entry.get("first")) or now
@@ -659,11 +775,12 @@ def _retry_undelivered(state: State, discord: DiscordClient, recent, targets_all
                                else "（PC が止まっていた可能性があります）" if tries <= 2 else ""))
             continue
         try:
-            discord.send(channel, render.apply_mention(payload, mention))
+            resent = render.apply_mention(payload, mention)
+            discord.send(channel, resent)
             entry["done"] = now_iso()
             sent += 1
             if recent is not None:
-                recent.add(channel, url)
+                recent.add(channel, url, resent.get("content"))
             log.info("re-sent a %s notification to %s", kind, dest.name)
         except DiscordError as exc:
             entry["tries"] = int(entry.get("tries") or 0) + 1
@@ -733,26 +850,28 @@ def _destination_alert(cfg: Config, discord: DiscordClient | None, state: State,
 
 class _RecentlyPosted:
     """Last-line guard against duplicates (e.g. two runners racing on the shared state):
-    skip a notification whose link already appears in the channel's latest messages."""
+    skip a notification whose link already appears in the channel's latest messages
+    (with `headline` also in the message text, for a start notice: see _guard_headline)."""
 
     def __init__(self, discord: DiscordClient):
         self.discord = discord
-        self.cache: dict[str, set[str]] = {}
+        self.cache: dict[str, list[tuple[str, str]]] = {}
 
-    def contains(self, channel_id: str, url: str | None) -> bool:
+    def contains(self, channel_id: str, url: str | None, headline: str | None = None) -> bool:
         if not url:
             return False
         if channel_id not in self.cache:
             try:
-                self.cache[channel_id] = self.discord.recent_urls(channel_id)
+                self.cache[channel_id] = list(self.discord.recent_notices(channel_id))
             except DiscordError as exc:
                 log.warning("could not read recent messages for the duplicate check: %s", exc)
-                self.cache[channel_id] = set()
-        return url in self.cache[channel_id]
+                self.cache[channel_id] = []
+        return any(link == url and (headline is None or headline in text)
+                   for link, text in self.cache[channel_id])
 
-    def add(self, channel_id: str, url: str | None) -> None:
+    def add(self, channel_id: str, url: str | None, text: str | None = None) -> None:
         if url and channel_id in self.cache:
-            self.cache[channel_id].add(url)
+            self.cache[channel_id].append((url, text or ""))
 
 
 def run(cfg: Config, role: str = "primary", dry_run: bool = False) -> int:
@@ -835,13 +954,15 @@ def run(cfg: Config, role: str = "primary", dry_run: bool = False) -> int:
             if targets:  # would have gone out: list it for `resume`, never send it later
                 muted_total += 1
                 embed = (note.payload.get("embeds") or [{}])[0]
-                state.muted[note.url or f"{note.item_type}:{note.item_id}"] = {
+                key = note.url or f"{note.item_type}:{note.item_id}"
+                if note.item_type == "live_start":
+                    key += "#start"  # the slot notice may be listed under the same link
+                state.muted[key] = {
                     "kind": note.kind, "title": str(embed.get("title") or "")[:120], "at": now_iso(),
                     "why": stopped,
                 }
                 log.warning("stopped: did not send the %s notification %s", note.kind, note.item_id)
-            (state.videos if note.item_type == "video" else state.posts)[note.item_id] = now_iso()
-            state.pending.pop(note.item_id, None)
+            _mark_handled(state, note)  # never sent later, also after resume
             continue
         sent_or_present = 0
         temporary: list[tuple[str, str, dict, DiscordError]] = []
@@ -851,7 +972,7 @@ def run(cfg: Config, role: str = "primary", dry_run: bool = False) -> int:
                 print(f"--- [dry-run] {note.kind} -> {dest.name} channel {channel}")
                 print(json.dumps(payload, ensure_ascii=False, indent=2))
                 sent_or_present += 1
-            elif recent is not None and recent.contains(channel, note.url):
+            elif recent is not None and recent.contains(channel, note.url, _guard_headline(note.kind)):
                 skipped += 1
                 sent_or_present += 1
                 log.info("this bot already posted that %s notification to %s", note.kind, dest.name)
@@ -861,7 +982,7 @@ def run(cfg: Config, role: str = "primary", dry_run: bool = False) -> int:
                     sent_or_present += 1
                     delivered_total += 1
                     if recent is not None:
-                        recent.add(channel, note.url)
+                        recent.add(channel, note.url, payload.get("content"))
                 except DiscordError as exc:
                     log.error("failed to send a %s notification to %s: %s", note.kind, dest.name, exc)
                     if exc.transient:
@@ -879,15 +1000,15 @@ def run(cfg: Config, role: str = "primary", dry_run: bool = False) -> int:
             # The payload is kept without mention: the retry adds the mention configured then.
             state.undelivered[f"{name}|{note.item_type}|{note.item_id}"] = {
                 "channel": channel, "payload": note.payload, "url": note.url, "kind": note.kind,
+                "item_type": note.item_type,
                 "first": now_iso(), "tries": 1, "done": None, "lost": None, "reported": None,
             }
             record_failure(name, "temporary", f"{channel}: {exc}", note.url)
-        target = state.videos if note.item_type == "video" else state.posts
-        target[note.item_id] = now_iso()
-        state.pending.pop(note.item_id, None)
+        _mark_handled(state, note)
         if note.kind != "member_post":
             log.info("%s %s %s -> %d destination(s)", "would notify" if dry_run else "notified",
-                     note.kind, note.item_id, sent_or_present)
+                     "live start" if note.item_type == "live_start" else note.kind, note.item_id,
+                     sent_or_present)
     if failed_destinations and not dry_run:
         _destination_alert(cfg, sender, state, failed_destinations)
     if not dry_run:
