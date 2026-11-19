@@ -196,6 +196,20 @@ class Notifier:
             (result.tolerated if covered else result.errors).append(rss_error)
         return _merge_refs(groups)
 
+    @staticmethod
+    def news_time(info: VideoInfo) -> datetime | None:
+        """When the item became worth announcing, for the max-age check (None: always new).
+        A stream's publish date is when its slot was created, which can be days before the slot
+        is made public: a slot created on 11-08, made public on 11-17 for an 11-18 stream, was
+        once skipped as "10 days old". So streams and premieres go by their stream time."""
+        if info.kind == "live_now":
+            return None  # on air right now
+        if info.kind in ("live_upcoming", "premiere"):
+            return info.scheduled_start  # in the future for a real slot; long past for a stale one
+        if info.kind == "live_archive":
+            return info.ended or info.published
+        return info.published
+
     def check_videos(self, state: State, result: CollectResult) -> None:
         refs = self.collect_video_refs(result)
         if not refs:
@@ -217,9 +231,10 @@ class Notifier:
                          ref.video_id, info.title)
                 state.videos[ref.video_id] = now_iso()
                 continue
-            if info.published and self.now - info.published > self.max_age:
-                log.info("video %s is old (%s); marking seen without notifying",
-                         ref.video_id, info.published.date())
+            news_time = self.news_time(info)
+            if news_time and self.now - news_time > self.max_age:
+                log.info("%s %s is old (%s); marking seen without notifying",
+                         info.kind, ref.video_id, news_time.date())
                 state.videos[ref.video_id] = now_iso()
                 continue
             log.info("new video %s kind=%s members_only=%s", ref.video_id, info.kind, info.members_only)
@@ -701,7 +716,7 @@ def _destination_alert(cfg: Config, discord: DiscordClient | None, state: State,
                      f"最大 {UNDELIVERED_RETRY_HOURS} 時間、自動でもう一度送ります（すでに届いた送り先には重複しません）。")
         elif category == "everywhere":
             cause = ("一時的なエラーのようです。どの送り先にも届かなかったので、次の確認からすべての送り先に"
-                     f"もう一度送ります（届くまで毎回。公開から {cfg.max_age_hours:g} 時間を過ぎたものは送りません）。")
+                     f"もう一度送ります（届くまで毎回。公開から（配信は開始予定・終了の時刻から）{cfg.max_age_hours:g} 時間を過ぎたものは送りません）。")
         else:
             cause = ("**この送り先には届いていません。** Bot がそのサーバーにいるか、チャンネルの権限"
                      "（見る・送信・埋め込みリンク・履歴を読む）を確認してください。"

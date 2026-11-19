@@ -101,6 +101,23 @@ def test_classify_variants():
     assert classify_video(_player(isLiveContent=True), VideoRef("x" * 11)).kind == "live_archive"
 
 
+def test_classify_keeps_the_stream_times_used_for_the_age_check():
+    # Shape of QclGfuKx8XI's microformat on 2026-11-17: slot created 11-08, stream on 11-18.
+    upcoming = _player(isLiveContent=True, isUpcoming=True, micro={
+        "publishDate": "2026-11-07T22:05:23-08:00",
+        "liveBroadcastDetails": {"isLiveNow": False, "startTimestamp": "2026-11-17T22:00:00+00:00"}})
+    info = classify_video(upcoming, VideoRef("QclGfuKx8XI"))
+    assert info.kind == "live_upcoming" and info.ended is None
+    assert info.published == datetime(2026, 11, 8, 6, 5, 23, tzinfo=timezone.utc)
+    assert info.scheduled_start == datetime(2026, 11, 17, 22, 0, tzinfo=timezone.utc)
+    archive = _player(isLiveContent=True, micro={"liveBroadcastDetails": {
+        "isLiveNow": False, "startTimestamp": "2026-11-17T22:00:00+00:00",
+        "endTimestamp": "2026-11-17T23:31:05+00:00"}})
+    info = classify_video(archive, VideoRef("QclGfuKx8XI"))
+    assert info.kind == "live_archive"
+    assert info.ended == datetime(2026, 11, 17, 23, 31, 5, tzinfo=timezone.utc)
+
+
 def test_classify_falls_back_to_listing_hints_when_watch_page_blocked():
     blocked = {"playabilityStatus": {"status": "LOGIN_REQUIRED", "reason": "Sign in to confirm you're not a bot"}}
     ref = VideoRef("abcdefghijk", sources={"streams"}, live_hint="upcoming", title="枠")

@@ -82,9 +82,10 @@ class VideoInfo:
     url: str
     thumbnail: str
     members_only: bool = False
-    published: datetime | None = None
+    published: datetime | None = None  # for an upcoming stream: when the slot was created, not made public
     scheduled_start: datetime | None = None
     from_watch_page: bool = True
+    ended: datetime | None = None  # live_archive: when the broadcast ended
 
 
 @dataclass
@@ -404,6 +405,7 @@ def classify_video(player: dict | None, ref: VideoRef) -> VideoInfo:
         published=_parse_iso(micro.get("publishDate") or micro.get("uploadDate")) or ref.published,
         scheduled_start=scheduled,
         from_watch_page=usable,
+        ended=_parse_iso(broadcast.get("endTimestamp")) if kind == "live_archive" else None,
     )
 
 

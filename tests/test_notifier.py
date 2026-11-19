@@ -22,6 +22,7 @@ class FakeYouTube:
 
     videos: list = []
     published: dict = {}
+    broadcast: dict = {}
     public_posts: list = []
     member_posts: list | None = None  # None -> no cookies configured
     member_logged_in = True
@@ -59,9 +60,13 @@ class FakeYouTube:
 
     def fetch_video_info(self, ref):
         published = self.published.get(ref.video_id, datetime.now(timezone.utc))
+        micro = {"publishDate": published.isoformat()}
+        if ref.video_id in self.broadcast:  # liveBroadcastDetails, as on a real watch page
+            micro["liveBroadcastDetails"] = self.broadcast[ref.video_id]
         player = {"videoDetails": {"title": ref.title, "isLiveContent": "streams" in ref.sources,
-                                   "isUpcoming": ref.live_hint == "upcoming"},
-                  "microformat": {"playerMicroformatRenderer": {"publishDate": published.isoformat()}}}
+                                   "isUpcoming": ref.live_hint == "upcoming",
+                                   "isLive": ref.live_hint == "live"},
+                  "microformat": {"playerMicroformatRenderer": micro}}
         return classify_video(player, ref)
 
     def fetch_posts_page(self, member=False):
@@ -92,6 +97,7 @@ def _cfg(tmp_path, **overrides):
 def fake_youtube(monkeypatch):
     FakeYouTube.videos = [VideoRef("old00000001", {"rss", "videos"}, title="old")]
     FakeYouTube.published = {}
+    FakeYouTube.broadcast = {}
     FakeYouTube.public_posts = [Post("UgkxOLD", text="old", published_text="3 日前")]
     FakeYouTube.member_posts = None
     FakeYouTube.member_logged_in = True
@@ -150,6 +156,69 @@ def test_old_items_are_marked_seen_silently(tmp_path, capsys):
     assert kinds == []
     state = _state(tmp_path)
     assert "revived0001" in state["videos"] and "UgkxANCIENT" in state["posts"]
+
+
+def test_stream_slot_created_days_before_it_was_made_public_is_announced(tmp_path, capsys):
+    """Seen 2026-11-17: QclGfuKx8XI, created 11-08 and made public 11-17 for an 11-18 stream,
+    was skipped as old while a slot created the day before went out."""
+    cfg = _cfg(tmp_path)
+    _run(cfg, capsys)
+    now = datetime.now(timezone.utc)
+    FakeYouTube.videos = [
+        VideoRef("QclGfuKx8XI", {"streams"}, title="ENGLISH STUDY", live_hint="upcoming"),
+        VideoRef("Hh0IwJFFq1c", {"streams"}, title="飲酒オフコラボ", live_hint="upcoming"),
+        *FakeYouTube.videos,
+    ]
+    FakeYouTube.published = {"QclGfuKx8XI": now - timedelta(days=9, hours=7),
+                              "Hh0IwJFFq1c": now - timedelta(hours=1)}
+    FakeYouTube.broadcast = {
+        "QclGfuKx8XI": {"isLiveNow": False, "startTimestamp": (now + timedelta(hours=6)).isoformat()},
+        "Hh0IwJFFq1c": {"isLiveNow": False, "startTimestamp": (now + timedelta(days=1)).isoformat()},
+    }
+    _, out, kinds = _run(cfg, capsys)
+    assert kinds == ["live_upcoming", "live_upcoming"]
+    assert "watch?v=QclGfuKx8XI" in out and "watch?v=Hh0IwJFFq1c" in out
+
+
+@pytest.mark.parametrize("ref, broadcast, expected", [
+    # on air now, slot created long ago
+    (VideoRef("livenow0001", {"streams"}, title="live", live_hint="live"),
+     {"isLiveNow": True, "startTimestamp": "NOW-1h"}, ["live_now"]),
+    # upcoming slot without a known schedule
+    (VideoRef("upcoming001", {"streams"}, title="slot", live_hint="upcoming"), None, ["live_upcoming"]),
+    # archive of a stream that ended an hour ago, slot created long ago
+    (VideoRef("archive0001", {"streams"}, title="archive"),
+     {"isLiveNow": False, "startTimestamp": "NOW-3h", "endTimestamp": "NOW-1h"}, ["live_archive"]),
+    # stale slot: its start time passed long ago (e.g. a waiting room without the free-chat title)
+    (VideoRef("staleslot01", {"streams"}, title="待機所", live_hint="upcoming"),
+     {"isLiveNow": False, "startTimestamp": "NOW-240h"}, []),
+    # old archive that shows up again (seen 2026-11-18: a 10-24 members-only archive)
+    (VideoRef("oldarchive1", {"streams"}, title="old archive"),
+     {"isLiveNow": False, "startTimestamp": "NOW-242h", "endTimestamp": "NOW-240h"}, []),
+    # archive without an end time: falls back to the publish date (20 days ago here)
+    (VideoRef("archive0002", {"streams"}, title="archive"),
+     {"isLiveNow": False, "startTimestamp": "NOW-3h"}, []),
+    # premiere scheduled in two hours, uploaded long ago
+    (VideoRef("premiere001", {"videos"}, title="premiere", live_hint="upcoming"),
+     {"isLiveNow": False, "startTimestamp": "NOW+2h"}, ["premiere"]),
+    # premiere whose scheduled time passed long ago
+    (VideoRef("premiere002", {"videos"}, title="premiere", live_hint="upcoming"),
+     {"isLiveNow": False, "startTimestamp": "NOW-240h"}, []),
+])
+def test_streams_are_aged_by_their_stream_time_not_the_slot_creation(tmp_path, capsys, ref,
+                                                                     broadcast, expected):
+    cfg = _cfg(tmp_path)
+    _run(cfg, capsys)
+    now = datetime.now(timezone.utc)
+    FakeYouTube.videos = [ref, *FakeYouTube.videos]
+    FakeYouTube.published = {ref.video_id: now - timedelta(days=20)}
+    if broadcast:
+        FakeYouTube.broadcast = {ref.video_id: {
+            k: (now + timedelta(hours=int(v[3:-1]))).isoformat() if str(v).startswith("NOW") else v
+            for k, v in broadcast.items()}}
+    _, _, kinds = _run(cfg, capsys)
+    assert kinds == expected
+    assert ref.video_id in _state(tmp_path)["videos"]  # announced or settled: never asked again
 
 
 def test_fallback_skips_while_primary_is_healthy_without_cookies(tmp_path, capsys):
