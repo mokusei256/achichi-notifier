@@ -391,3 +391,56 @@ def test_a_stale_copy_never_undoes_an_announced_start():
         state = State(live={"x": {"scheduled": None, "done": mine, "at": at}})
         state.merge_from(State(live={"x": {"scheduled": None, "done": theirs, "at": at}}))
         assert state.live["x"]["done"] == merged, (mine, theirs)
+
+
+def test_stream_on_another_channel_registered_with_watch_is_announced_when_it_starts(wired, tmp_path):
+    state = _state(tmp_path)
+    state["live"]["collab00001"] = {"scheduled": (_now() + timedelta(hours=1)).isoformat(), "done": None,
+                                    "at": _now().isoformat(), "external": True, "title": "【オフコラボ】"}
+    _write_state(tmp_path, state)
+    Watch.pages = {"collab00001": {"status": "upcoming", "scheduled": _now() + timedelta(hours=1)}}
+    _run(wired)  # an hour before: not looked at; never in this channel's tabs, never in the seen set
+    assert Watch.fetched == [] and Discord.posted == []
+    state = _state(tmp_path)
+    state["live"]["collab00001"]["scheduled"] = (_now() + timedelta(minutes=5)).isoformat()
+    _write_state(tmp_path, state)
+    Watch.pages["collab00001"] = {"status": "live", "started": _now(), "title": "【オフコラボ】雑談"}
+    _run(wired)
+    assert _sent("collab00001") == [START]
+    assert _state(tmp_path)["live"]["collab00001"]["done"] == "started"
+    assert _state(tmp_path)["live"]["collab00001"]["external"] is True
+    _run(wired)
+    assert _sent("collab00001") == [START] and Watch.fetched == []
+
+
+def test_watch_command_registers_lists_and_removes(wired, tmp_path, monkeypatch, capsys):
+    from achichi_notifier import watch_cli
+
+    assert watch_cli.video_id_of("https://www.youtube.com/watch?v=7sXGlZUV8rA&t=1") == "7sXGlZUV8rA"
+    assert watch_cli.video_id_of("https://youtu.be/7sXGlZUV8rA") == "7sXGlZUV8rA"
+    assert watch_cli.video_id_of("https://www.youtube.com/live/7sXGlZUV8rA?si=x") == "7sXGlZUV8rA"
+    assert watch_cli.video_id_of("7sXGlZUV8rA") == "7sXGlZUV8rA"
+    with pytest.raises(Exception):
+        watch_cli.video_id_of("https://www.youtube.com/@AchichiMela")
+
+    store = FileStateStore(tmp_path / "state.json")
+    monkeypatch.setattr(watch_cli, "_client", lambda cfg: None)
+    monkeypatch.setattr(watch_cli, "_store", lambda cfg, discord: store)
+    monkeypatch.setattr(watch_cli, "YouTubeClient", lambda channel_id: Watch())
+    start = _now() + timedelta(hours=2)
+    Watch.pages = {"7sXGlZUV8rA": {"status": "upcoming", "scheduled": start, "title": "【オフコラボ】"},
+                   "notastream1": {"status": "blocked"}}
+    assert watch_cli.cmd_add(wired, "https://www.youtube.com/watch?v=7sXGlZUV8rA") == 0
+    entry = _state(tmp_path)["live"]["7sXGlZUV8rA"]
+    assert entry["external"] is True and entry["done"] is None and entry["scheduled"] == start.isoformat()
+    assert watch_cli.cmd_add(wired, "notastream1") == 1  # watch page unreadable: not registered
+    assert "notastream1" not in _state(tmp_path)["live"]
+    assert watch_cli.cmd_list(wired) == 0 and "【オフコラボ】" in capsys.readouterr().out
+    assert watch_cli.cmd_remove(wired, "7sXGlZUV8rA") == 0
+    assert _state(tmp_path)["live"]["7sXGlZUV8rA"]["done"] == "removed"
+    Watch.pages["7sXGlZUV8rA"] = {"status": "live", "started": _now()}
+    state = _state(tmp_path)
+    state["live"]["7sXGlZUV8rA"]["scheduled"] = _now().isoformat()
+    _write_state(tmp_path, state)
+    _run(wired)
+    assert Discord.posted == []  # removed: never announced

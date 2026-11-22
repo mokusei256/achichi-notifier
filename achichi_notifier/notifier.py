@@ -40,7 +40,7 @@ BROWSER_REFRESH_ALERT_FAILURES = 3
 LIVE_START_LEAD = timedelta(minutes=10)
 LIVE_WAIT = timedelta(hours=12)
 LIVE_CHECKS_PER_RUN = 5
-LIVE_FINAL = ("started", "ended", "excluded", "not_live")
+LIVE_FINAL = ("started", "ended", "excluded", "not_live", "removed")
 START_HEADLINE = render.HEADLINES["live_now"]
 
 
@@ -159,7 +159,8 @@ def excluded_stream(cfg: Config, kind: str, title: str | None) -> bool:
 
 
 def _wait_live(state: State, video_id: str, scheduled: datetime | None) -> None:
-    state.live[video_id] = {"scheduled": scheduled.isoformat() if scheduled else None,
+    state.live[video_id] = {**state.live.get(video_id, {}),  # keeps e.g. "external" (watch CLI)
+                            "scheduled": scheduled.isoformat() if scheduled else None,
                             "done": None, "at": now_iso()}
 
 
@@ -304,6 +305,8 @@ class Notifier:
             if video_id not in state.videos:
                 continue  # new this run: check_videos announces it (or it waits for a retry)
             entry = state.live.get(video_id) or {}
+            if entry.get("external"):
+                continue  # registered with `watch`: checked below by its start time
             done = entry.get("done")
             if done in LIVE_FINAL:
                 continue
@@ -327,8 +330,27 @@ class Notifier:
             if checks >= LIVE_CHECKS_PER_RUN:
                 log.info("more than %d streams to check for a start; the rest wait for the next run",
                          LIVE_CHECKS_PER_RUN)
-                break
+                return
             checks += 1
+            self._live_status(state, result, ref, self.yt.fetch_video_info(ref))
+        # Streams on other channels registered with `watch` (e.g. a collab): not in this
+        # channel's tabs, so only their start time (or an unknown one, every LIVE_START_LEAD)
+        # brings them up.
+        for video_id, entry in list(state.live.items()):
+            if not entry.get("external") or entry.get("done"):
+                continue
+            scheduled, last = parse_time(entry.get("scheduled")), parse_time(entry.get("at"))
+            if scheduled is None:
+                if last and self.now - last < LIVE_START_LEAD:
+                    continue
+            elif self.now < scheduled - LIVE_START_LEAD:
+                continue
+            if checks >= LIVE_CHECKS_PER_RUN:
+                log.info("more than %d streams to check for a start; the rest wait for the next run",
+                         LIVE_CHECKS_PER_RUN)
+                return
+            checks += 1
+            ref = VideoRef(video_id, title=entry.get("title"))
             self._live_status(state, result, ref, self.yt.fetch_video_info(ref))
 
     def _live_status(self, state: State, result: CollectResult, ref: VideoRef, info: VideoInfo) -> None:
@@ -340,10 +362,13 @@ class Notifier:
             # settles it once it is sent (or held back by the emergency stop).
             _wait_live(state, video_id, info.started or self.now)
             log.info("stream %s is on air; announcing its start", video_id)
+            meta = result.meta
+            if (state.live.get(video_id) or {}).get("external") and info.channel_title:
+                meta = ChannelMeta(info.channel_title, None, info.channel_url)  # the host's channel
             result.queue(Notification(
                 kind="live_now", item_type="live_start", item_id=video_id,
                 sort_key=info.started or self.now,
-                payload=render.video_payload(info, result.meta, None),
+                payload=render.video_payload(info, meta, None),
             ))
         elif not info.from_watch_page:
             pass  # the watch page could not be read: nothing learned, look again next run

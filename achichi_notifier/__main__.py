@@ -5,6 +5,7 @@
     python -m achichi_notifier check
     python -m achichi_notifier stop | resume | status
     python -m achichi_notifier delete --since 1h [--yes]
+    python -m achichi_notifier watch <url> | --list | --remove <url>
 """
 
 from __future__ import annotations
@@ -286,6 +287,12 @@ def main(argv: list[str] | None = None) -> int:
     p_del.add_argument("--ids", help="only these message ids, comma-separated (the list prints the command)")
     p_del.add_argument("--yes", action="store_true", help="really delete (otherwise only list)")
 
+    p_watch = sub.add_parser("watch", help="announce when a stream on another channel (e.g. a collab) "
+                                            "goes on air")
+    p_watch.add_argument("url", nargs="?", help="the stream's URL or video id")
+    p_watch.add_argument("--list", action="store_true", help="show the registered streams")
+    p_watch.add_argument("--remove", metavar="URL_OR_ID", help="stop watching this stream")
+
     p_dest = sub.add_parser("dest", help="manage notification destinations (other Discord servers)")
     dsub = p_dest.add_subparsers(dest="dest_command", required=True)
     dsub.add_parser("list", help="show all destinations")
@@ -346,6 +353,13 @@ def main(argv: list[str] | None = None) -> int:
                 return dest_cli.cmd_check(cfg, args.name, args.send_test)
         if args.command == "check":
             return _check(cfg)
+        if args.command == "watch":
+            from . import watch_cli
+            if args.remove:
+                return watch_cli.cmd_remove(cfg, args.remove)
+            if args.list or not args.url:
+                return watch_cli.cmd_list(cfg)
+            return watch_cli.cmd_add(cfg, args.url)
         if args.command in ("stop", "resume", "status", "delete"):
             from . import control_cli
             if args.command == "stop":

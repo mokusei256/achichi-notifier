@@ -87,6 +87,8 @@ class VideoInfo:
     from_watch_page: bool = True
     ended: datetime | None = None  # live_archive: when the broadcast ended
     started: datetime | None = None  # live_now / live_archive: when the broadcast actually began
+    channel_title: str | None = None  # the channel the video is on (from its watch page)
+    channel_url: str | None = None
 
 
 @dataclass
@@ -409,6 +411,8 @@ def classify_video(player: dict | None, ref: VideoRef) -> VideoInfo:
         ended=_parse_iso(broadcast.get("endTimestamp")) if kind == "live_archive" else None,
         started=(_parse_iso(broadcast.get("startTimestamp"))
                  if kind in ("live_now", "live_archive") else None),
+        channel_title=details.get("author") or text_of(micro.get("ownerChannelName")) or None,
+        channel_url=(micro.get("ownerProfileUrl") or "").replace("http://", "https://", 1) or None,
     )
 
 
