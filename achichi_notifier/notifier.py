@@ -17,7 +17,8 @@ from . import destinations as dests
 from . import render
 from .config import Config, ConfigError
 from .discord_api import DiscordClient, DiscordError, mark_preview
-from .state import BACKLOG_PREFIX, DiscordStateStore, FileStateStore, State, now_iso, parse_time
+from .state import (BACKLOG_PREFIX, DiscordStateStore, FileStateStore, State, bump_reg, next_reg, now_iso,
+                    parse_time)
 from .youtube import (
     VIDEO_TABS, ChannelMeta, Post, PostsPage, VideoInfo, VideoRef, YouTubeClient, YouTubeError,
     approx_age_hours,
@@ -39,7 +40,15 @@ BROWSER_REFRESH_ALERT_FAILURES = 3
 # LIVE_WAIT after it, only a "live" badge on the channel tab makes the bot look again.
 LIVE_START_LEAD = timedelta(minutes=10)
 LIVE_WAIT = timedelta(hours=12)
+# Watch pages looked at per run for this channel's slots, and as many again for `watch` streams.
 LIVE_CHECKS_PER_RUN = 5
+# A stream registered with `watch` is also looked at this often before its window, so a start
+# moved earlier (or a host going live early) is noticed: it has no tab badge to go by.
+WATCH_RECHECK = timedelta(minutes=30)
+# A watched stream whose page cannot be read (deleted, made private) is given up once it is
+# LIVE_WAIT past its start and has stayed unreadable this long (not on one failed fetch).
+WATCH_UNREADABLE = timedelta(hours=1)
+RUN_SLACK = timedelta(minutes=1)  # runs start a few seconds apart from the 5-minute grid
 LIVE_FINAL = ("started", "ended", "excluded", "not_live", "removed")
 START_HEADLINE = render.HEADLINES["live_now"]
 
@@ -159,9 +168,37 @@ def excluded_stream(cfg: Config, kind: str, title: str | None) -> bool:
 
 
 def _wait_live(state: State, video_id: str, scheduled: datetime | None) -> None:
-    state.live[video_id] = {**state.live.get(video_id, {}),  # keeps e.g. "external" (watch CLI)
-                            "scheduled": scheduled.isoformat() if scheduled else None,
-                            "done": None, "at": now_iso()}
+    old = state.live.get(video_id, {})
+    entry = {**old,  # keeps e.g. "external" (watch CLI)
+             "scheduled": scheduled.isoformat() if scheduled else None, "done": None, "at": now_iso()}
+    if old.get("external") and old.get("done") in ("stale", "unreadable"):
+        # A `watch` entry the bot gave up on comes back (e.g. listed here with a new start
+        # time): a newer "reg" keeps the stored given-up copy from winning the merge ("started"
+        # still wins). A removal by the user is not undone this way.
+        entry["reg"] = next_reg(old)
+    state.live[video_id] = entry
+
+
+def _adopt_removed(state: State, video_id: str) -> dict:
+    """A `watch` entry the user removed whose stream is listed in this channel's tabs: a plain
+    entry of this channel from now on (looked at like any of its slots while listed, not watched
+    once unlisted). The smallest "reg" step makes what is learned from now on win over the stored
+    removed copy on merge, but not over a `watch` / `watch --remove` saved meanwhile (next_reg).
+    (One the bot gave up on is looked at like a slot of this channel while listed, and a readable
+    look makes it a waiting `watch` again: _wait_live.)"""
+    old = state.live[video_id]
+    entry = {k: v for k, v in old.items() if k not in ("external", "checked", "unreadable_since")}
+    entry.update(done=None, reg=bump_reg(old))
+    state.live[video_id] = entry
+    return entry
+
+
+def _waiting_since(entry: dict, scheduled: datetime | None) -> datetime | None:
+    """When the wait for a start began to count, for giving up after LIVE_WAIT: the start time,
+    or for a `watch` entry its registration if that is later (registering again restarts it)."""
+    registered = parse_time(entry.get("reg")) if entry.get("external") else None
+    times = [t for t in (scheduled, registered) if t]
+    return max(times) if times else None
 
 
 def _settle_live(state: State, video_id: str, why: str) -> None:
@@ -169,12 +206,15 @@ def _settle_live(state: State, video_id: str, why: str) -> None:
 
 
 def _mark_handled(state: State, note: Notification) -> None:
-    """The item is announced (or deliberately not): never queue it again."""
+    """The item is announced (or deliberately not): never queue it again. Only here is a start
+    recorded as announced, so a notice that reached nobody is tried again next run."""
     if note.item_type == "live_start":
         _settle_live(state, note.item_id, "started")
         return
     (state.videos if note.item_type == "video" else state.posts)[note.item_id] = now_iso()
     state.pending.pop(note.item_id, None)
+    if note.kind == "live_now":  # first seen on air: this notice says it began
+        _settle_live(state, note.item_id, "started")
 
 
 def _guard_headline(kind: str | None) -> str | None:
@@ -202,6 +242,8 @@ class Notifier:
         self.yt = yt
         self.now = now or datetime.now(timezone.utc)
         self.max_age = timedelta(hours=cfg.max_age_hours)
+        self.listed: set[str] = set()  # video ids in this run's channel tabs / RSS
+        self.listing_complete = False  # every tab answered with videos this run
 
     # ------------------------------------------------------------------ videos
 
@@ -224,6 +266,7 @@ class Notifier:
             except YouTubeError as exc:
                 result.errors.append(f"{tab}: {exc}")
                 covered = False
+        self.listing_complete = covered
         if rss_error:
             # The feed answers HTTP 404 now and then. The /videos, /shorts and /streams tabs
             # list everything it does, so it only counts as an error when they did not all
@@ -248,6 +291,8 @@ class Notifier:
     def check_videos(self, state: State, result: CollectResult) -> None:
         refs = self.collect_video_refs(result)
         if not refs:
+            if "videos" in state.seeded:
+                self.check_live_starts(state, [], result)  # streams registered with `watch` still
             return
         if "videos" not in state.seeded:
             for ref in refs:
@@ -264,6 +309,17 @@ class Notifier:
             new = new[: self.cfg.max_new_per_run]
         for ref in new:
             info = self.yt.fetch_video_info(ref)
+            entry = state.live.get(ref.video_id) or {}
+            if entry.get("external") and entry.get("done") == "removed":
+                entry = _adopt_removed(state, ref.video_id)  # first listed here
+            if entry.get("external"):
+                entry["checked"] = self.now.isoformat()  # its watch page was just looked at
+            if render.GROUPS.get(info.kind) == "live" and entry.get("external") and entry.get("done") == "started":
+                # Its start already went out through `watch`, and now it shows up in this
+                # channel's tabs (on air, as an archive, or with a stale "upcoming" badge).
+                log.info("stream %s was already announced as started; marking seen", ref.video_id)
+                state.videos[ref.video_id] = now_iso()
+                continue
             if excluded_stream(self.cfg, info.kind, info.title):
                 log.info("stream %s is excluded by EXCLUDE_LIVE_TITLES (%s); marking seen without notifying",
                          ref.video_id, info.title)
@@ -288,8 +344,10 @@ class Notifier:
             ))
             if info.kind == "live_upcoming":
                 _wait_live(state, ref.video_id, info.scheduled_start)  # announce its start later
-            elif info.kind == "live_now":
-                _settle_live(state, ref.video_id, "started")  # this notice already says it is on air
+            elif info.kind == "live_now" and entry.get("external"):
+                # Keep a `watch` entry due every run until this notice is delivered, also if the
+                # tabs stop listing it. It is settled as "started" once delivered (_mark_handled).
+                _wait_live(state, ref.video_id, info.started or self.now)
         self.check_live_starts(state, refs, result)
 
     def check_live_starts(self, state: State, refs: list[VideoRef], result: CollectResult) -> None:
@@ -298,16 +356,32 @@ class Notifier:
 
         Looked at again (on its watch page, which is what decides): a seen stream the channel
         tab marks as live, and a tracked slot from LIVE_START_LEAD before its start time on, so
-        a missing tab badge never loses the start. A stream found already over gets nothing."""
-        checks = 0
+        a missing tab badge never loses the start. A stream found already over gets nothing.
+        Streams registered with `watch` are handled by _check_watched, except that this
+        channel's tabs count for them too when they are listed here (they are then looked at
+        here, with this channel's slots). Up to LIVE_CHECKS_PER_RUN pages are looked at here per
+        run, and as many again by _check_watched, so this channel's slots never use up the looks
+        for streams elsewhere."""
+        checks, looked = 0, set()
+        self.listed = {ref.video_id for ref in refs}
         for ref in refs:
             video_id = ref.video_id
             if video_id not in state.videos:
                 continue  # new this run: check_videos announces it (or it waits for a retry)
             entry = state.live.get(video_id) or {}
-            if entry.get("external"):
-                continue  # registered with `watch`: checked below by its start time
+            if entry.get("external") and entry.get("done") == "removed":
+                entry = _adopt_removed(state, video_id)
             done = entry.get("done")
+            if entry.get("external"):
+                if done == "unreadable" or (done == "stale" and not entry.get("scheduled")):
+                    # Given up (unreadable, or no start time for LIVE_WAIT, e.g. in a run whose
+                    # listing missed it), but listed here: looked at like a slot of this channel.
+                    done = None
+                elif not done:
+                    scheduled = parse_time(entry.get("scheduled"))
+                    in_window = scheduled is not None and self.now >= scheduled - LIVE_START_LEAD
+                    if ref.live_hint != "live" and not in_window:
+                        continue  # _check_watched rechecks it by its start time
             if done in LIVE_FINAL:
                 continue
             if ref.live_hint == "live":
@@ -316,7 +390,8 @@ class Notifier:
                 continue  # stale (never began): only a live badge brings it back
             elif not entry or not entry.get("scheduled"):
                 # Start time unknown: a slot seen before start tracking existed, or one whose
-                # watch page could not be read. Learn it (again every LIVE_START_LEAD at most).
+                # watch page could not be read. Learn it: again LIVE_START_LEAD after a readable
+                # look (which moves "at"); every run while the page stays unreadable.
                 last = parse_time(entry.get("at"))
                 if ref.live_hint != "upcoming" or (last and self.now - last < LIVE_START_LEAD):
                     continue
@@ -330,31 +405,60 @@ class Notifier:
             if checks >= LIVE_CHECKS_PER_RUN:
                 log.info("more than %d streams to check for a start; the rest wait for the next run",
                          LIVE_CHECKS_PER_RUN)
-                return
+                break  # a waiting `watch` stream left out here: _check_watched, on its schedule
             checks += 1
+            looked.add(video_id)
+            if entry.get("external"):
+                entry["checked"] = self.now.isoformat()
             self._live_status(state, result, ref, self.yt.fetch_video_info(ref))
-        # Streams on other channels registered with `watch` (e.g. a collab): not in this
-        # channel's tabs, so only their start time (or an unknown one, every LIVE_START_LEAD)
-        # brings them up.
-        for video_id, entry in list(state.live.items()):
-            if not entry.get("external") or entry.get("done"):
-                continue
-            scheduled, last = parse_time(entry.get("scheduled")), parse_time(entry.get("at"))
-            if scheduled is None:
-                if last and self.now - last < LIVE_START_LEAD:
-                    continue
-            elif self.now < scheduled - LIVE_START_LEAD:
-                continue
+        self._check_watched(state, result, looked)
+
+    def _check_watched(self, state: State, result: CollectResult, looked: set) -> None:
+        """Streams registered with `watch` (e.g. a collab on another channel): no tab lists
+        them, so they are looked at by their start time (every run from LIVE_START_LEAD before
+        it), and every WATCH_RECHECK before that (every LIVE_START_LEAD when the start time is
+        unknown, or after an unreadable look) in case the start moved earlier."""
+        never = datetime.min.replace(tzinfo=timezone.utc)
+        window: list[tuple[timedelta, str]] = []
+        rechecks: list[tuple[timedelta, str]] = []
+        for video_id, entry in state.live.items():
+            if (not entry.get("external") or entry.get("done") or video_id in looked
+                    or ("video", video_id) in result.queued or ("live_start", video_id) in result.queued):
+                continue  # settled, or already looked at / queued this run through this channel's tabs
+            scheduled = parse_time(entry.get("scheduled"))
+            last = parse_time(entry.get("checked") or entry.get("at")) or never
+            in_window = scheduled is not None and self.now >= scheduled - LIVE_START_LEAD
+            gap = timedelta(0) if in_window else LIVE_START_LEAD if scheduled is None else WATCH_RECHECK
+            overdue = self.now - last - gap
+            if in_window:
+                window.append((overdue, video_id))
+            elif overdue >= -RUN_SLACK:
+                rechecks.append((overdue, video_id))
+        # Streams in their window first, the longest unchecked first (so they take turns when
+        # there are more than the cap); one look is kept for the most overdue recheck, so
+        # streams waiting in their window never hold back noticing an early start elsewhere.
+        # These looks are their own: this channel's slots (check_live_starts) never use them up.
+        window.sort(key=lambda d: (-d[0], d[1]))
+        rechecks.sort(key=lambda d: (-d[0], d[1]))
+        keep = LIVE_CHECKS_PER_RUN - 1 if rechecks else LIVE_CHECKS_PER_RUN
+        order = window[:keep] + rechecks[:1] + window[keep:] + rechecks[1:]
+        checks = 0
+        for _, video_id in order:
             if checks >= LIVE_CHECKS_PER_RUN:
                 log.info("more than %d streams to check for a start; the rest wait for the next run",
                          LIVE_CHECKS_PER_RUN)
                 return
             checks += 1
-            ref = VideoRef(video_id, title=entry.get("title"))
+            # The run's start time (what the gap above is measured with); _live_status moves it
+            # back after an unreadable look so the next one comes sooner.
+            state.live[video_id]["checked"] = self.now.isoformat()
+            ref = VideoRef(video_id, title=state.live[video_id].get("title"))
             self._live_status(state, result, ref, self.yt.fetch_video_info(ref))
 
     def _live_status(self, state: State, result: CollectResult, ref: VideoRef, info: VideoInfo) -> None:
         video_id = ref.video_id
+        if info.from_watch_page and video_id in state.live:
+            state.live[video_id].pop("unreadable_since", None)
         if excluded_stream(self.cfg, info.kind, info.title):
             _settle_live(state, video_id, "excluded")
         elif info.kind == "live_now":
@@ -371,10 +475,30 @@ class Notifier:
                 payload=render.video_payload(info, meta, None),
             ))
         elif not info.from_watch_page:
-            pass  # the watch page could not be read: nothing learned, look again next run
+            # Nothing learned: look again next run. A watched stream on another channel whose page
+            # stays unreadable (deleted or made private) is given up once it is LIVE_WAIT past its
+            # start and has been unreadable for WATCH_UNREADABLE.
+            entry = state.live.get(video_id)
+            if entry is not None and entry.get("external"):
+                if entry.get("scheduled"):  # look again in LIVE_START_LEAD rather than WATCH_RECHECK
+                    entry["checked"] = (self.now - WATCH_RECHECK + LIVE_START_LEAD).isoformat()
+                since = parse_time(entry.setdefault("unreadable_since", now_iso()))
+                waiting = _waiting_since(entry, parse_time(entry.get("scheduled")))
+                # Not while this channel's tabs list it: as before `watch` existed, a listed
+                # slot is looked at again for as long as it is listed.
+                if (self.listing_complete and video_id not in self.listed
+                        and waiting and self.now - waiting > LIVE_WAIT
+                        and since and self.now - since >= WATCH_UNREADABLE):
+                    log.info("watched stream %s has been unreadable since %s; no longer checked",
+                             video_id, entry["unreadable_since"])
+                    _settle_live(state, video_id, "unreadable")
         elif info.kind == "live_upcoming":
-            scheduled = info.scheduled_start or parse_time((state.live.get(video_id) or {}).get("scheduled"))
-            if scheduled and self.now - scheduled > LIVE_WAIT:
+            entry = state.live.get(video_id) or {}
+            scheduled = info.scheduled_start or parse_time(entry.get("scheduled"))
+            # No start time yet while listed here: keep learning it, as for a slot of this channel
+            # (a `watch` registration's own time would otherwise count; it may be long past).
+            waiting = None if scheduled is None and video_id in self.listed else _waiting_since(entry, scheduled)
+            if waiting and self.now - waiting > LIVE_WAIT:
                 log.info("stream %s has not begun %s after its start time; no longer checked",
                          video_id, LIVE_WAIT)
                 _settle_live(state, video_id, "stale")

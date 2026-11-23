@@ -13,12 +13,13 @@ import re
 from .config import Config, ConfigError
 from .control_cli import CMD, _client, _store
 from .notifier import LIVE_START_LEAD
-from .state import now_iso, parse_time
+from .state import next_reg, now_iso, parse_time
 from .youtube import VIDEO_ID_RE, VideoRef, YouTubeClient
 
 _URL_ID = re.compile(r"(?:[?&]v=|youtu\.be/|/live/|/shorts/|/embed/)([A-Za-z0-9_-]{11})(?![A-Za-z0-9_-])")
 STATUS = {None: "待機中（開始したら通知）", "started": "開始を通知済み", "ended": "終わっていた（通知なし）",
-          "stale": "開始予定から 12 時間たっても始まらず、確認をやめた", "removed": "登録を外した",
+          "stale": "開始予定（不明なら登録）から 12 時間たっても始まらず、確認をやめた", "removed": "登録を外した",
+          "unreadable": "視聴ページを読めない状態が続き、確認をやめた（削除・非公開の可能性）",
           "excluded": "除外タイトル（通知なし）", "not_live": "配信ではなかった（通知なし）"}
 
 
@@ -48,9 +49,15 @@ def cmd_add(cfg: Config, target: str) -> int:
         print(f"この配信の開始はもう通知済みです: {info.title}")
         return 0
     start = info.scheduled_start if info.kind == "live_upcoming" else info.started
+    # A new "reg" makes this registration win over an older copy (after --remove, or a stream
+    # that was given up), also against a runner saving its older state; an announced start
+    # still wins on merge (state._live_wins), so this can never cause a second notice.
+    reg = next_reg(entry)
+    now = now_iso()
     state.live[video_id] = {
-        "scheduled": start.isoformat() if start else None, "done": None, "at": now_iso(),
-        "external": True, "title": info.title[:120], "channel": info.channel_title,
+        "scheduled": start.isoformat() if start else None, "done": None, "at": now,
+        "external": True, "title": info.title[:120], "channel": info.channel_title, "reg": reg,
+        "checked": now,  # its page was just read: rechecks count from here, not an older look
     }
     store.save(state)
     print(f"✅ 登録しました: {info.title}（{info.channel_title or 'チャンネル不明'}）")
@@ -61,7 +68,7 @@ def cmd_add(cfg: Config, target: str) -> int:
         print(f"   開始予定 {start.astimezone().strftime('%m/%d %H:%M')}。その {minutes} 分前から毎回確かめ、"
               "始まったら「🔴 配信が始まりました」を送ります（枠の通知は送りません）。")
     else:
-        print("   開始予定時刻が分からないため、10 分ごとに確かめます。")
+        print("   開始予定時刻が分からないため、10 分ごとに確かめます（登録から 12 時間たっても始まらなければ確認をやめます）。")
     print(f"   取り消す: {CMD} watch --remove {video_id}")
     return 0
 
@@ -91,8 +98,9 @@ def cmd_remove(cfg: Config, target: str) -> int:
     if entry.get("done"):
         print(f"すでに確認を終えています（{STATUS.get(entry.get('done'), entry.get('done'))}）。")
         return 0
-    # Settled rather than deleted: a runner saving its older copy merges entries back in.
-    state.live[video_id] = {**entry, "done": "removed", "at": now_iso()}
+    # Settled rather than deleted: a runner saving its older copy merges entries back in. A new
+    # "reg" makes the removal win over that copy (and a later `watch` wins over the removal).
+    state.live[video_id] = {**entry, "done": "removed", "at": now_iso(), "reg": next_reg(entry)}
     store.save(state)
     print(f"✅ 登録を外しました: {entry.get('title') or video_id}")
     return 0

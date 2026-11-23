@@ -12,7 +12,7 @@ import logging
 import os
 import tempfile
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from .discord_api import DiscordClient, DiscordError
@@ -55,9 +55,40 @@ def _max_iso(a: str | None, b: str | None) -> str | None:
         parse_time(b) or datetime.min.replace(tzinfo=timezone.utc)) else b
 
 
+def next_reg(entry: dict) -> str:
+    """A `watch` registration time later than the entry's previous one (microseconds), so
+    the newer registration (or revival) wins on merge (see _live_wins)."""
+    now = datetime.now(timezone.utc)
+    previous = parse_time(entry.get("reg"))
+    if previous and previous + timedelta(microseconds=2) > now:
+        now = previous + timedelta(microseconds=2)  # also past bump_reg of the same copy
+    return now.isoformat()
+
+
+def bump_reg(entry: dict) -> str:
+    """The smallest step past the entry's "reg", for a change the bot makes to a `watch` entry:
+    it wins over that copy on merge, while a `watch` / `watch --remove` saved from the same copy
+    (next_reg, two steps or more) still wins over the bot's change."""
+    previous = parse_time(entry.get("reg")) or datetime(2000, 1, 1, tzinfo=timezone.utc)
+    return (previous + timedelta(microseconds=1)).isoformat()
+
+
 def _live_rank(entry: dict) -> int:
     done = entry.get("done")
-    return 0 if not done else 1 if done == "stale" else 2
+    return 0 if not done else 1 if done in ("stale", "unreadable") else 2
+
+
+def _live_wins(theirs: dict, mine: dict) -> bool:
+    """An announced start always wins (never announced twice). Otherwise a newer `watch`
+    registration (or removal) wins, and between copies of one registration the more settled."""
+    started_theirs, started_mine = theirs.get("done") == "started", mine.get("done") == "started"
+    if started_theirs != started_mine:
+        return started_theirs
+    reg_theirs = parse_time(theirs.get("reg")) or datetime.min.replace(tzinfo=timezone.utc)
+    reg_mine = parse_time(mine.get("reg")) or datetime.min.replace(tzinfo=timezone.utc)
+    if reg_theirs != reg_mine:
+        return reg_theirs > reg_mine
+    return _live_rank(theirs) > _live_rank(mine)
 
 
 @dataclass
@@ -84,7 +115,8 @@ class State:
     muted: dict[str, dict] = field(default_factory=dict)
     # Streams whose start is watched for (see Notifier.check_live_starts): video_id ->
     # {scheduled: start time or None, done: None while waiting, else why it is settled
-    # ("started" = start announced or held back, "ended", "excluded", "stale", "not_live"), at}.
+    # ("started" = start announced or held back, "ended", "excluded", "stale", "not_live",
+    # "removed", "unreadable"), at}. Entries from `watch` also carry external, reg, checked...
     live: dict[str, dict] = field(default_factory=dict)
     # Unknown top-level keys written by a newer version are carried through untouched,
     # so an older copy of the bot (e.g. on the Mac) never erases them.
@@ -168,8 +200,14 @@ class State:
             mine = self.live.get(key)
             # Settled on either side stays settled, so a start is never announced twice.
             # "stale" (gave up waiting) can still turn into "started", so it ranks lower.
-            if mine is None or _live_rank(theirs) > _live_rank(mine):
+            # Registering again with `watch` (newer "reg") starts over (see watch_cli).
+            if mine is None:
                 self.live[key] = dict(theirs)
+                continue
+            keep, drop = (dict(theirs), mine) if _live_wins(theirs, mine) else (mine, theirs)
+            if drop.get("checked"):  # a throttle stamp: the newest look counts, whichever copy wins
+                keep["checked"] = _max_iso(keep.get("checked"), drop.get("checked"))
+            self.live[key] = keep
         # A pending post that either side has since announced or seen publicly is settled.
         for key in [k for k in self.pending if k in self.posts]:
             del self.pending[key]
