@@ -2,8 +2,9 @@
 
 The bot only reads this channel's tabs, so a stream hosted elsewhere is registered by hand.
 It goes into state.live marked "external"; every full run then looks at its watch page from
-LIVE_START_LEAD before its start time on and sends one "🔴 配信が始まりました" to the same
-destinations as this channel's streams (see Notifier.check_live_starts).
+LIVE_START_LEAD before its start time on and sends one "🔴 配信が始まりました" to the
+destinations taking "collab" notices: the .env one, and others only when their --kinds list it
+(see Notifier.check_live_starts and destinations.OPT_IN_KINDS).
 """
 
 from __future__ import annotations
@@ -69,6 +70,11 @@ def cmd_add(cfg: Config, target: str) -> int:
               "始まったら「🔴 配信が始まりました」を送ります（枠の通知は送りません）。")
     else:
         print("   開始予定時刻が分からないため、10 分ごとに確かめます（登録から 12 時間たっても始まらなければ確認をやめます）。")
+    if info.channel_id and info.channel_id == cfg.youtube_channel_id:
+        print("   このチャンネルの配信なので、ふだんの配信と同じ送り先（すべての送り先）に送ります。")
+    else:
+        print("   送り先: .env の送り先（main）と、dest add の --kinds に collab を入れた送り先だけ"
+              "（このチャンネルのタブにも載る配信は、ふだんの配信と同じすべての送り先）。")
     print(f"   取り消す: {CMD} watch --remove {video_id}")
     return 0
 

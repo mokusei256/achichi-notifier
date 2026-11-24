@@ -293,6 +293,8 @@ def main(argv: list[str] | None = None) -> int:
     p_watch.add_argument("--list", action="store_true", help="show the registered streams")
     p_watch.add_argument("--remove", metavar="URL_OR_ID", help="stop watching this stream")
 
+    from . import destinations as dests
+
     p_dest = sub.add_parser("dest", help="manage notification destinations (other Discord servers)")
     dsub = p_dest.add_subparsers(dest="dest_command", required=True)
     dsub.add_parser("list", help="show all destinations")
@@ -301,8 +303,9 @@ def main(argv: list[str] | None = None) -> int:
     d_add.add_argument("--channel", required=True, help="channel id for everything")
     for group in ("video", "short", "live", "post"):
         d_add.add_argument(f"--{group}-channel", help=f"separate channel id for {group} notifications")
-    d_add.add_argument("--kinds", help="comma list of video,short,live,post,member_post (default: all)")
-    for key in ("video", "short", "live", "post", "member_post"):
+    d_add.add_argument("--kinds", help=f"comma list of {','.join(dests.KIND_CHOICES)} "
+                       f"(default for a new destination: all but {','.join(dests.OPT_IN_KINDS)})")
+    for key in dests.KIND_CHOICES:
         d_add.add_argument(f"--mention-{key.replace('_', '-')}", dest=f"mention_{key}",
                            help=f"mention for {key}, e.g. '<@&ROLE_ID>' or @everyone")
     d_add.add_argument("--clear-mentions", action="store_true",
@@ -323,6 +326,8 @@ def main(argv: list[str] | None = None) -> int:
         sys.excepthook = lambda kind, value, tb: logging.getLogger("achichi_notifier").critical(
             "uncaught error", exc_info=(kind, value, tb))
     load_dotenv(Path(args.env_file))
+    # Thumbnails kept for "before / after" notices: next to the .env (the app folder).
+    os.environ.setdefault("THUMB_DIR", str(Path(args.env_file).expanduser().resolve().parent / "thumbs"))
     if getattr(args, "state_file", None):
         os.environ["STATE_BACKEND"] = "file"
         os.environ["STATE_FILE"] = args.state_file

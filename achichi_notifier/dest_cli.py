@@ -127,7 +127,7 @@ def cmd_add(cfg: Config, args) -> int:
         merged_mentions.update(mentions)  # re-adding keeps mentions/kinds/enabled you did not pass
         st.destinations[name] = dests.Destination(
             name=name, channels=channels, mentions=merged_mentions,
-            kinds=kinds if kinds is not None else (set(old.kinds) if old else set(dests.KIND_CHOICES)),
+            kinds=kinds if kinds is not None else (set(old.kinds) if old else set(dests.DEFAULT_KINDS)),
             enabled=old.enabled if old else True,
         ).to_dict()
 

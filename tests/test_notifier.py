@@ -17,6 +17,9 @@ from achichi_notifier.youtube import (
 SECRET_TEXT = "ひみつの日記の本文"
 
 
+THUMB = 1_790_000_000  # a thumbnail version (Unix time) from before every test's "now"
+
+
 class FakeYouTube:
     """Stands in for YouTubeClient; configured through class attributes per test."""
 
@@ -36,6 +39,9 @@ class FakeYouTube:
     rss_fails = False
     failing_tabs: set = set()
     calls: list = []
+    # Thumbnails: video_id -> current version (THUMB if not listed); thumbs_down -> i.ytimg.com fails.
+    thumbs: dict = {}
+    thumbs_down = False
 
     def __init__(self):
         self.cookies_configured = FakeYouTube.member_posts is not None or FakeYouTube.cookie_error is not None
@@ -57,6 +63,23 @@ class FakeYouTube:
         if tab in self.failing_tabs:
             raise YouTubeError(f"ytInitialData not found on /channel/UC/{tab}")
         return [r for r in self.videos if tab in r.sources], ChannelMeta("Mela Ch.", None, None)
+
+    def fetch_tab_all(self, tab):
+        if tab in self.failing_tabs:
+            raise YouTubeError(f"ytInitialData not found on /channel/UC/{tab}")
+        return [r for r in self.videos if tab in r.sources]
+
+    def thumb_probe(self, video_id, newer_than):
+        if self.thumbs_down:
+            raise YouTubeError("thumbnail check failed: ConnectionError")
+        version = self.thumbs.get(video_id, THUMB)
+        return version if version > newer_than else None
+
+    def thumb_image(self, video_id, version):
+        current = self.thumbs.get(video_id, THUMB)
+        if self.thumbs_down or (version is not None and version > current):
+            raise YouTubeError("thumbnail download -> HTTP 404")
+        return current, f"jpeg {video_id} {current}".encode(), "maxresdefault.jpg"
 
     def fetch_video_info(self, ref):
         published = self.published.get(ref.video_id, datetime.now(timezone.utc))
@@ -111,6 +134,8 @@ def fake_youtube(monkeypatch):
     FakeYouTube.rss_fails = False
     FakeYouTube.failing_tabs = set()
     FakeYouTube.calls = []
+    FakeYouTube.thumbs = {}
+    FakeYouTube.thumbs_down = False
     monkeypatch.setattr(notifier, "YouTubeClient", FakeYouTube)
 
 
@@ -492,7 +517,7 @@ class FakeDiscordClient:
     def me(self):
         return {"id": "bot"}
 
-    def send(self, channel_id, payload):
+    def send(self, channel_id, payload, files=None):
         self.sent.append((channel_id, payload))
         return {"id": str(len(self.sent))}
 

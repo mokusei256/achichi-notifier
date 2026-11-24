@@ -15,6 +15,11 @@ HEADLINES = {
     "live_archive": "📼 配信アーカイブが公開されました",
     "post": "📝 新しい投稿がありました",
     "member_post": "🔒 メンバー限定の投稿がありました",
+    "collab_live": "🔴 配信が始まりました",  # a `watch` stream on another channel
+    # A thumbnail of this channel's stream (slot or archive), video or short was changed.
+    "thumb_live": "🖼️ サムネイルが変更されました",
+    "thumb_video": "🖼️ サムネイルが変更されました",
+    "thumb_short": "🖼️ サムネイルが変更されました",
 }
 LABELS = {
     "video": "動画", "short": "ショート", "premiere": "プレミア公開",
@@ -30,8 +35,14 @@ COLORS = {
 GROUPS = {
     "video": "video", "premiere": "video", "short": "short",
     "live_upcoming": "live", "live_now": "live", "live_archive": "live",
-    "post": "post", "member_post": "post",
+    "post": "post", "member_post": "post", "collab_live": "live",
+    "thumb_live": "live", "thumb_video": "video", "thumb_short": "short",
 }
+# Notification kinds a destination takes or leaves on their own (destinations.KIND_CHOICES);
+# every other kind goes by its GROUPS entry.
+DEST_KINDS = {"member_post": "member_post", "collab_live": "collab",
+              "thumb_live": "thumbnail", "thumb_video": "thumbnail", "thumb_short": "thumbnail"}
+THUMB_COLOR = 0xF1C40F
 
 
 def _cut(text: str, limit: int) -> str:
@@ -138,6 +149,26 @@ def post_payload(post: Post, meta: ChannelMeta | None, mention: str | None) -> d
         "embeds": [embed],
         "allowed_mentions": _allowed_mentions(mention),
     }
+
+
+def thumb_payload(kind: str, title: str, url: str, label: str, meta: ChannelMeta | None,
+                  changed: datetime, after: str, before: str | None) -> dict:
+    """A changed thumbnail: the old and the new image side by side (two embeds with the same
+    link make one embed with both images), or the new one alone when the old one is unknown.
+    `after` / `before` are image URLs (attachment://... for uploaded files)."""
+    embed: dict = {
+        "title": _cut(title, 256),
+        "url": url,
+        "color": THUMB_COLOR,
+        "description": "左が変更前、右が変更後です。" if before else "変更後のサムネイルです（変更前の画像はありません）。",
+        "image": {"url": before or after},
+        "footer": {"text": f"YouTube・サムネイル変更・{label}"},
+        "timestamp": changed.isoformat(),
+    }
+    if author := _author(meta):
+        embed["author"] = author
+    embeds = [embed, {"url": url, "image": {"url": after}}] if before else [embed]
+    return {"content": _content(kind, None), "embeds": embeds, "allowed_mentions": _allowed_mentions(None)}
 
 
 def apply_mention(payload: dict, mention: str | None) -> dict:

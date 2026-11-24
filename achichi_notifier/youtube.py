@@ -25,6 +25,9 @@ import requests
 log = logging.getLogger(__name__)
 
 BASE = "https://www.youtube.com"
+THUMBS = "https://i.ytimg.com/vi"
+# Seconds to connect (to each of i.ytimg.com's many addresses in turn) and to read.
+THUMB_TIMEOUT = (3, 10)
 USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"
@@ -41,6 +44,10 @@ VIDEO_TABS = ("videos", "shorts", "streams")
 
 class YouTubeError(Exception):
     pass
+
+
+class ThumbUnreachable(YouTubeError):
+    """i.ytimg.com did not answer in time (or at all)."""
 
 
 # --------------------------------------------------------------------------- data
@@ -89,6 +96,7 @@ class VideoInfo:
     started: datetime | None = None  # live_now / live_archive: when the broadcast actually began
     channel_title: str | None = None  # the channel the video is on (from its watch page)
     channel_url: str | None = None
+    channel_id: str | None = None  # the channel the video is on (UC...), from its watch page
 
 
 @dataclass
@@ -282,9 +290,14 @@ def _lockup_live_hint(lockup: dict) -> str | None:
 
 
 def parse_tab_videos(data: dict, source: str) -> list[VideoRef]:
+    return parse_video_items(_selected_tab_content(data), source)
+
+
+def parse_video_items(content: Any, source: str) -> list[VideoRef]:
+    """Videos in a tab page's content or in the items of one of its continuation pages."""
     refs: list[VideoRef] = []
     seen: set[str] = set()
-    for node in _walk(_selected_tab_content(data)):
+    for node in _walk(content):
         video_id = title = live_hint = None
         is_short = source == "shorts"
         members = False
@@ -320,6 +333,24 @@ def parse_tab_videos(data: dict, source: str) -> list[VideoRef]:
         seen.add(video_id)
         refs.append(VideoRef(video_id, {source}, is_short, members, title or None, None, live_hint))
     return refs
+
+
+def continuation_token(content: Any) -> str | None:
+    """The token of a tab page's "load more" item (None on its last page)."""
+    for node in _walk(content):
+        item = node.get("continuationItemRenderer")
+        if isinstance(item, dict):
+            token = _dig(item, "continuationEndpoint", "continuationCommand", "token")
+            if isinstance(token, str) and token:
+                return token
+    return None
+
+
+def thumb_version(etag: str | None) -> int | None:
+    """i.ytimg.com's ETag of a thumbnail: its version, the Unix time it was set ("1795108436"),
+    or 0 for the frame YouTube picked itself."""
+    value = (etag or "").strip().removeprefix("W/").strip('"')
+    return int(value) if value.isdigit() and int(value) < 1 << 32 else None
 
 
 def parse_rss(xml_text: str) -> tuple[list[VideoRef], str | None]:
@@ -413,6 +444,7 @@ def classify_video(player: dict | None, ref: VideoRef) -> VideoInfo:
                  if kind in ("live_now", "live_archive") else None),
         channel_title=details.get("author") or text_of(micro.get("ownerChannelName")) or None,
         channel_url=(micro.get("ownerProfileUrl") or "").replace("http://", "https://", 1) or None,
+        channel_id=details.get("channelId") or micro.get("externalChannelId") or None,
     )
 
 
@@ -714,6 +746,82 @@ class YouTubeClient:
     def fetch_tab(self, tab: str) -> tuple[list[VideoRef], ChannelMeta | None]:
         _, data = self._get_initial_data(self._tab_path(tab))
         return parse_tab_videos(data, tab), parse_channel_meta(data)
+
+    def fetch_tab_all(self, tab: str, max_pages: int = 40) -> list[VideoRef]:
+        """Every video of a tab: its first page, then its "load more" pages (public, no cookies)."""
+        html, data = self._get_initial_data(self._tab_path(tab))
+        content = _selected_tab_content(data)
+        refs = parse_video_items(content, tab)
+        token = continuation_token(content)
+        version = re.search(r'"INNERTUBE_CLIENT_VERSION"\s*:\s*"([^"]+)"', html)
+        if token and not version:
+            raise YouTubeError(f"no client version on /{tab}: cannot load its further pages")
+        session = self._new_session()
+        pages = 1
+        while token:
+            if pages >= max_pages:
+                raise YouTubeError(f"/{tab} has more than {max_pages} pages")
+            body = {"context": {"client": {"clientName": "WEB", "clientVersion": version.group(1),
+                                           "hl": "ja", "gl": "JP"}},
+                    "continuation": token}
+            try:
+                resp = session.post(f"{BASE}/youtubei/v1/browse", params={"prettyPrint": "false"},
+                                    json=body, timeout=self.timeout)
+                data = resp.json() if resp.status_code == 200 else None
+            except (requests.RequestException, ValueError) as exc:
+                raise YouTubeError(f"/{tab} page {pages + 1} failed: {exc.__class__.__name__}") from None
+            if not isinstance(data, dict):
+                raise YouTubeError(f"/{tab} page {pages + 1} -> HTTP {resp.status_code}")
+            items = [item for action in data.get("onResponseReceivedActions") or []
+                     for item in _dig(action, "appendContinuationItemsAction", "continuationItems") or []]
+            if not items:
+                raise YouTubeError(f"/{tab} page {pages + 1} came back empty")
+            known = {ref.video_id for ref in refs}
+            refs += [ref for ref in parse_video_items(items, tab) if ref.video_id not in known]
+            token = continuation_token(items)
+            pages += 1
+        return refs
+
+    # Thumbnails live on i.ytimg.com. A URL with ?v=<version in hex> is answered (with the
+    # newest image) only when the thumbnail is at least that new, else HTTP 404 (cached 30 s),
+    # and it is a cache key of its own: plain URLs may serve an old copy for up to 2 hours.
+
+    def thumb_probe(self, video_id: str, newer_than: int) -> int | None:
+        """The thumbnail's version if it is newer than `newer_than` (-1: any), else None."""
+        url = f"{THUMBS}/{video_id}/mqdefault.jpg?v={newer_than + 1:x}"
+        try:
+            resp = self._thumb_session().head(url, timeout=THUMB_TIMEOUT)
+        except requests.RequestException as exc:
+            raise ThumbUnreachable(f"thumbnail check failed: {exc.__class__.__name__}") from None
+        if resp.status_code == 404:
+            return None
+        version = thumb_version(resp.headers.get("ETag")) if resp.status_code == 200 else None
+        if version is None:
+            raise YouTubeError(f"thumbnail check -> HTTP {resp.status_code} (ETag {resp.headers.get('ETag')!r})")
+        return version
+
+    def thumb_image(self, video_id: str, version: int | None) -> tuple[int, bytes, str]:
+        """(version, JPEG, file name) of the thumbnail, at least as new as `version` (a small
+        number such as a minute count gets the current one without any cache's old copy;
+        None: the plain URL). The largest size there is: maxresdefault, else hqdefault."""
+        last = "no image"
+        query = "" if version is None else f"?v={version:x}"
+        for name in ("maxresdefault.jpg", "hqdefault.jpg"):
+            try:
+                resp = self._thumb_session().get(f"{THUMBS}/{video_id}/{name}{query}",
+                                                 timeout=THUMB_TIMEOUT)
+            except requests.RequestException as exc:
+                raise ThumbUnreachable(f"thumbnail download failed: {exc.__class__.__name__}") from None
+            got = thumb_version(resp.headers.get("ETag"))
+            if resp.status_code == 200 and got is not None and resp.content:
+                return got, resp.content, name
+            last = f"HTTP {resp.status_code}"
+        raise YouTubeError(f"thumbnail download -> {last}")
+
+    def _thumb_session(self) -> requests.Session:
+        if getattr(self, "_thumbs", None) is None:
+            self._thumbs = self._new_session()  # no YouTube cookies
+        return self._thumbs
 
     def fetch_video_info(self, ref: VideoRef) -> VideoInfo:
         try:

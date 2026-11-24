@@ -25,7 +25,8 @@ MAX_ENTRIES = 1500
 PENDING_TTL_HOURS = 72
 BACKLOG_PREFIX = "backlog@"  # pending entries recorded at the members-only comparison baseline
 KNOWN_KEYS = {"version", "videos", "posts", "seeded", "runners", "alerts", "pending",
-              "destinations", "destinations_updated", "undelivered", "muted", "live"}
+              "destinations", "destinations_updated", "undelivered", "muted", "live",
+              "thumbs", "thumbs_listed", "thumbs_listed_ok"}
 UNDELIVERED_KEEP_HOURS = 24
 LOST_REPORT_KEEP_DAYS = 7  # an unreported lost notification waits this long for the #管理 alert
 UNHANDLED_KEEP_DAYS = 30  # an undelivered entry no run has handled yet (bot stopped meanwhile)
@@ -33,6 +34,8 @@ MUTED_KEEP_DAYS = 7  # notifications held back by the emergency stop stay listed
 MUTED_MAX_ENTRIES = 200
 LIVE_KEEP_DAYS = 30  # stream start tracking entries (see Notifier.check_live_starts)
 LIVE_MAX_ENTRIES = 300
+THUMB_KEEP_DAYS = 30  # thumbnail tracking of a video no listing has shown since (see thumbnails.py)
+THUMB_MAX_ENTRIES = 3000
 
 
 def now_iso() -> str:
@@ -53,6 +56,21 @@ def _max_iso(a: str | None, b: str | None) -> str | None:
         return a or b
     return a if (parse_time(a) or datetime.min.replace(tzinfo=timezone.utc)) >= (
         parse_time(b) or datetime.min.replace(tzinfo=timezone.utc)) else b
+
+
+def _min_iso(a: str | None, b: str | None) -> str | None:
+    if not a or not b:
+        return a or b
+    return b if _max_iso(a, b) == a and a != b else a
+
+
+def as_int(value) -> int:
+    """A stored integer (e.g. a thumbnail version); 0 when missing or unreadable."""
+    if isinstance(value, bool):
+        return 0
+    if isinstance(value, int):
+        return value
+    return int(value) if isinstance(value, str) and value.isdigit() else 0
 
 
 def next_reg(entry: dict) -> str:
@@ -118,6 +136,12 @@ class State:
     # ("started" = start announced or held back, "ended", "excluded", "stale", "not_live",
     # "removed", "unreadable"), at}. Entries from `watch` also carry external, reg, checked...
     live: dict[str, dict] = field(default_factory=dict)
+    # Thumbnails of this channel's videos (see thumbnails.py): video_id -> {v: the version
+    # announced last (at first the one found), seen: the newest found (newer than v: a notice is
+    # due), since, found, tab, title, listed, checked}; and when every tab page was last read.
+    thumbs: dict[str, dict] = field(default_factory=dict)
+    thumbs_listed: str | None = None  # when it is next due (a failed listing moves it an hour on)
+    thumbs_listed_ok: str | None = None  # when it last worked
     # Unknown top-level keys written by a newer version are carried through untouched,
     # so an older copy of the bot (e.g. on the Mac) never erases them.
     extra: dict = field(default_factory=dict)
@@ -141,6 +165,9 @@ class State:
                          if isinstance(v, dict)},
             muted={k: dict(v) for k, v in (data.get("muted") or {}).items() if isinstance(v, dict)},
             live={k: dict(v) for k, v in (data.get("live") or {}).items() if isinstance(v, dict)},
+            thumbs={k: dict(v) for k, v in (data.get("thumbs") or {}).items() if isinstance(v, dict)},
+            thumbs_listed=data.get("thumbs_listed"),
+            thumbs_listed_ok=data.get("thumbs_listed_ok"),
             extra={k: v for k, v in data.items() if k not in KNOWN_KEYS},
         )
 
@@ -159,6 +186,9 @@ class State:
             "undelivered": self.undelivered,
             "muted": self.muted,
             "live": self.live,
+            "thumbs": self.thumbs,
+            "thumbs_listed": self.thumbs_listed,
+            "thumbs_listed_ok": self.thumbs_listed_ok,
         }
 
     def merge_from(self, other: State) -> None:
@@ -208,6 +238,24 @@ class State:
             if drop.get("checked"):  # a throttle stamp: the newest look counts, whichever copy wins
                 keep["checked"] = _max_iso(keep.get("checked"), drop.get("checked"))
             self.live[key] = keep
+        for key, theirs in other.thumbs.items():
+            mine = self.thumbs.get(key)
+            if mine is None:
+                self.thumbs[key] = dict(theirs)
+                continue
+            # Versions only grow, so a notice sent on either side is never sent again; the
+            # newest listing's title and tab win.
+            newer = _max_iso(mine.get("listed"), theirs.get("listed")) != mine.get("listed")
+            merged = dict(theirs) if newer else dict(mine)
+            merged["v"] = max(as_int(mine.get("v")), as_int(theirs.get("v")))
+            merged["seen"] = max(as_int(mine.get("seen")), as_int(theirs.get("seen")), merged["v"])
+            for stamp in ("since", "listed", "checked", "found"):
+                value = (_min_iso if stamp == "since" else _max_iso)(mine.get(stamp), theirs.get(stamp))
+                if value:
+                    merged[stamp] = value
+            self.thumbs[key] = merged
+        self.thumbs_listed = _max_iso(self.thumbs_listed, other.thumbs_listed)
+        self.thumbs_listed_ok = _max_iso(self.thumbs_listed_ok, other.thumbs_listed_ok)
         # A pending post that either side has since announced or seen publicly is settled.
         for key in [k for k in self.pending if k in self.posts]:
             del self.pending[key]
@@ -244,6 +292,11 @@ class State:
                        and ((t := parse_time(v.get("at"))) is None or t.timestamp() >= live_cutoff)),
                       key=lambda kv: str(kv[1].get("at") or ""), reverse=True)
         self.live = dict(live[:LIVE_MAX_ENTRIES])
+        thumb_cutoff = now_ts - THUMB_KEEP_DAYS * 86400
+        thumbs = sorted(((k, v) for k, v in self.thumbs.items() if isinstance(v, dict)
+                         and ((t := parse_time(v.get("listed"))) is None or t.timestamp() >= thumb_cutoff)),
+                        key=lambda kv: str(kv[1].get("listed") or ""), reverse=True)
+        self.thumbs = dict(thumbs[:THUMB_MAX_ENTRIES])
         cutoff = datetime.now(timezone.utc).timestamp() - PENDING_TTL_HOURS * 3600
         self.pending = {k: v for k, v in self.pending.items()
                         if (t := parse_time(v.removeprefix(BACKLOG_PREFIX))) is None

@@ -17,8 +17,9 @@ from . import destinations as dests
 from . import render
 from .config import Config, ConfigError
 from .discord_api import DiscordClient, DiscordError, mark_preview
-from .state import (BACKLOG_PREFIX, DiscordStateStore, FileStateStore, State, bump_reg, next_reg, now_iso,
-                    parse_time)
+from .state import (BACKLOG_PREFIX, DiscordStateStore, FileStateStore, State, as_int, bump_reg, next_reg,
+                    now_iso, parse_time)
+from .thumbnails import ThumbnailWatch
 from .youtube import (
     VIDEO_TABS, ChannelMeta, Post, PostsPage, VideoInfo, VideoRef, YouTubeClient, YouTubeError,
     approx_age_hours,
@@ -56,10 +57,12 @@ START_HEADLINE = render.HEADLINES["live_now"]
 @dataclass
 class Notification:
     kind: str  # key of render.HEADLINES
-    item_type: str  # "video" | "post" | "live_start" (a slot announced earlier went on air)
-    item_id: str
+    item_type: str  # "video" | "post" | "live_start" (a slot announced earlier went on air) | "thumbnail"
+    item_id: str  # for a thumbnail: "<video id>@<its new version>"
     sort_key: datetime
     payload: dict
+    files: list = field(default_factory=list)  # (name, bytes) uploaded with the payload
+    retry_payload: dict | None = None  # filed for per-destination retries (they carry no files)
 
     @property
     def group(self) -> str:
@@ -84,6 +87,7 @@ class CollectResult:
     member_status: str | None = None  # None | ok | unreadable | read_failed | logged_out | not_member | fetch_failed
     member_detail: str | None = None
     cookie_source: str | None = None  # firefox | file | env
+    thumb_problem: str | None = None  # thumbnail checks need a look (see _thumb_alert)
     queued: set = field(default_factory=set)
 
     def queue(self, note: Notification) -> None:
@@ -211,6 +215,13 @@ def _mark_handled(state: State, note: Notification) -> None:
     if note.item_type == "live_start":
         _settle_live(state, note.item_id, "started")
         return
+    if note.item_type == "thumbnail":
+        video_id, _, version = note.item_id.partition("@")
+        entry = state.thumbs.get(video_id)
+        if entry is not None:  # versions only grow: never announced again (State.merge_from)
+            entry["v"] = max(as_int(entry.get("v")), as_int(version))
+            entry["seen"] = max(as_int(entry.get("seen")), entry["v"])
+        return
     (state.videos if note.item_type == "video" else state.posts)[note.item_id] = now_iso()
     state.pending.pop(note.item_id, None)
     if note.kind == "live_now":  # first seen on air: this notice says it began
@@ -222,7 +233,7 @@ def _guard_headline(kind: str | None) -> str | None:
     posted?" check also looks for its headline (also for a stream first seen on air: its slot
     notice may have reached Discord although the send looked failed). Everything else is
     matched by link alone."""
-    return START_HEADLINE if kind == "live_now" else None
+    return START_HEADLINE if kind in ("live_now", "collab_live") else None
 
 
 def _merge_refs(groups: list[list[VideoRef]]) -> list[VideoRef]:
@@ -244,6 +255,8 @@ class Notifier:
         self.max_age = timedelta(hours=cfg.max_age_hours)
         self.listed: set[str] = set()  # video ids in this run's channel tabs / RSS
         self.listing_complete = False  # every tab answered with videos this run
+        self.refs: list[VideoRef] = []  # this run's listing (for check_thumbnails)
+        self.dry_run = False
 
     # ------------------------------------------------------------------ videos
 
@@ -289,7 +302,7 @@ class Notifier:
         return info.published
 
     def check_videos(self, state: State, result: CollectResult) -> None:
-        refs = self.collect_video_refs(result)
+        refs = self.refs = self.collect_video_refs(result)
         if not refs:
             if "videos" in state.seeded:
                 self.check_live_starts(state, [], result)  # streams registered with `watch` still
@@ -467,10 +480,17 @@ class Notifier:
             _wait_live(state, video_id, info.started or self.now)
             log.info("stream %s is on air; announcing its start", video_id)
             meta = result.meta
-            if (state.live.get(video_id) or {}).get("external") and info.channel_title:
+            external = bool((state.live.get(video_id) or {}).get("external"))
+            if external and info.channel_title:
                 meta = ChannelMeta(info.channel_title, None, info.channel_url)  # the host's channel
+            # A `watch` stream on another channel goes to the destinations taking "collab";
+            # one on this channel, or listed in its tabs (whose slot notice went everywhere),
+            # is announced like its own streams.
+            here = (info.channel_id == self.cfg.youtube_channel_id
+                    or video_id in self.listed or video_id in state.videos)
             result.queue(Notification(
-                kind="live_now", item_type="live_start", item_id=video_id,
+                kind="collab_live" if external and not here else "live_now",
+                item_type="live_start", item_id=video_id,
                 sort_key=info.started or self.now,
                 payload=render.video_payload(info, meta, None),
             ))
@@ -509,6 +529,30 @@ class Notifier:
             _settle_live(state, video_id, "ended")
         else:
             _settle_live(state, video_id, "not_live")
+
+    # ------------------------------------------------------------------ thumbnails
+
+    def check_thumbnails(self, state: State, result: CollectResult) -> None:
+        """Changed thumbnails (see thumbnails.py). A secondary feature: whatever goes wrong
+        here is logged and reported, never stops this run's other notifications."""
+        if "videos" not in state.seeded:
+            return  # no listing has ever worked: nothing to go by
+        watch = ThumbnailWatch(self.yt, self.now, self.cfg.thumb_dir, dry_run=self.dry_run,
+                               max_age=self.max_age)
+        try:
+            notices = watch.run(state, self.refs, result.meta,
+                                lambda title: excluded_stream(self.cfg, "live_upcoming", title))
+        except Exception as exc:  # noqa: BLE001
+            log.exception("thumbnail check failed")
+            result.thumb_problem = f"確認中にエラーが起きました（{exc.__class__.__name__}）"
+            return
+        result.thumb_problem = watch.problem
+        for notice in notices:
+            result.queue(Notification(
+                kind=notice.kind, item_type="thumbnail", item_id=f"{notice.video_id}@{notice.version}",
+                sort_key=notice.sort_key, payload=notice.payload, files=notice.files,
+                retry_payload=notice.retry_payload,
+            ))
 
     # ------------------------------------------------------------------ posts
 
@@ -658,6 +702,7 @@ class Notifier:
         if mode == "full":
             self.check_videos(state, result)
             self.check_posts(state, result, include_public=True)
+            self.check_thumbnails(state, result)
         elif mode == "members":
             self.check_posts(state, result, include_public=False)
         else:
@@ -862,6 +907,31 @@ def _browser_refresh_alert(cfg: Config, discord: DiscordClient | None, state: St
         log.warning("could not send the browser refresh alert: %s", exc)
 
 
+THUMB_ALERT_STREAK = 6  # runs in a row (half an hour) before #管理 hears about it
+THUMB_ALERT_INTERVAL = timedelta(hours=24)
+
+
+def _thumb_alert(cfg: Config, discord: DiscordClient | None, state: State, runner: dict,
+                 problem: str | None) -> None:
+    """Thumbnail checks keep running into trouble (or skipped a burst of changes): tell #管理,
+    at most once a day."""
+    runner["thumb_problem_streak"] = int(runner.get("thumb_problem_streak") or 0) + 1 if problem else 0
+    if not problem or (runner["thumb_problem_streak"] < THUMB_ALERT_STREAK and "通知しませんでした" not in problem):
+        return
+    if discord is None or cfg.state_backend != "discord" or not cfg.state_channel_id:
+        return
+    now = datetime.now(timezone.utc)
+    if _fresh(state.alerts.get("thumbnails"), now, THUMB_ALERT_INTERVAL.total_seconds() / 60):
+        return
+    message = (f"⚠️ **サムネイル変更の確認で問題が起きています**: {problem}\n"
+               "動画・配信の通知には影響しません。続くようなら `notifier.log` の thumbnail の行を確認してください。")
+    try:
+        discord.send(cfg.state_channel_id, {"content": message, "allowed_mentions": {"parse": []}})
+        state.alerts["thumbnails"] = now_iso()
+    except DiscordError as exc:
+        log.warning("could not send the thumbnail alert: %s", exc)
+
+
 DESTINATION_ALERT_INTERVAL = timedelta(hours=12)
 
 
@@ -1049,6 +1119,7 @@ def run(cfg: Config, role: str = "primary", dry_run: bool = False) -> int:
         mode = "members"
 
     notifier = Notifier(cfg, yt, now)
+    notifier.dry_run = dry_run
     result = notifier.collect(state, mode)
     for error in result.errors:
         log.warning("source error: %s", error)
@@ -1084,6 +1155,8 @@ def run(cfg: Config, role: str = "primary", dry_run: bool = False) -> int:
                       source=result.cookie_source)
     if cfg.firefox_profile and not dry_run:
         _browser_refresh_alert(cfg, sender, state, role)
+    if mode == "full" and not dry_run:
+        _thumb_alert(cfg, sender, state, runner, result.thumb_problem)
 
     targets_all = dests.resolve(cfg, state)
     recent = _RecentlyPosted(sender) if sender is not None and not dry_run else None
@@ -1127,7 +1200,20 @@ def run(cfg: Config, role: str = "primary", dry_run: bool = False) -> int:
                 log.info("this bot already posted that %s notification to %s", note.kind, dest.name)
             else:
                 try:
-                    sender.send(channel, payload)
+                    try:
+                        if note.files:
+                            sender.send(channel, payload, files=note.files)
+                        else:
+                            sender.send(channel, payload)
+                    except DiscordError as exc:
+                        if not note.files or not note.retry_payload or exc.transient:
+                            raise
+                        # e.g. no "Attach Files" permission in that channel: send the version
+                        # that links to the images instead
+                        log.warning("could not upload the images of a %s notification to %s (%s); "
+                                    "sending it with links only", note.kind, dest.name, exc)
+                        payload = render.apply_mention(note.retry_payload, mention)
+                        sender.send(channel, payload)
                     sent_or_present += 1
                     delivered_total += 1
                     if recent is not None:
@@ -1148,7 +1234,8 @@ def run(cfg: Config, role: str = "primary", dry_run: bool = False) -> int:
             # Delivered elsewhere: retry only this destination for a while (no duplicates).
             # The payload is kept without mention: the retry adds the mention configured then.
             state.undelivered[f"{name}|{note.item_type}|{note.item_id}"] = {
-                "channel": channel, "payload": note.payload, "url": note.url, "kind": note.kind,
+                "channel": channel, "payload": note.retry_payload or note.payload, "url": note.url,
+                "kind": note.kind,
                 "item_type": note.item_type,
                 "first": now_iso(), "tries": 1, "done": None, "lost": None, "reported": None,
             }

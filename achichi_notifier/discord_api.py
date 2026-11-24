@@ -84,8 +84,16 @@ class DiscordClient:
             self._me = self._request("GET", "/users/@me")
         return self._me
 
-    def send(self, channel_id: str, payload: dict) -> dict:
-        return self._request("POST", f"/channels/{channel_id}/messages", json=payload)
+    def send(self, channel_id: str, payload: dict, files: list[tuple[str, bytes]] | None = None) -> dict:
+        """Post a message; `files` (name, JPEG) are uploaded with it (embeds show them as
+        attachment://name)."""
+        if not files:
+            return self._request("POST", f"/channels/{channel_id}/messages", json=payload)
+        body = {**payload, "attachments": [{"id": i, "filename": name} for i, (name, _) in enumerate(files)]}
+        return self._request("POST", f"/channels/{channel_id}/messages",
+                             data={"payload_json": json.dumps(body)},
+                             files={f"files[{i}]": (name, data, "image/jpeg")
+                                    for i, (name, data) in enumerate(files)})
 
     def edit_message(self, channel_id: str, message_id: str, payload: dict) -> dict:
         return self._request("PATCH", f"/channels/{channel_id}/messages/{message_id}", json=payload)

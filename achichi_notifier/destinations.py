@@ -14,14 +14,21 @@ from . import render
 
 MAIN = "main"
 # What a destination can receive. member_post is separate from post so a server can get
-# public posts without the members-only links (or the other way round).
-KIND_CHOICES = ("video", "short", "live", "post", "member_post")
+# public posts without the members-only links (or the other way round). The opt-in kinds go
+# to the .env destination ("main") only, unless a `dest add` destination lists them in --kinds:
+# collab = start notices of `watch` streams on other channels; thumbnail = a changed thumbnail
+# of this channel's videos, shorts or streams.
+KIND_CHOICES = ("video", "short", "live", "post", "member_post", "collab", "thumbnail")
+OPT_IN_KINDS = ("collab", "thumbnail")
+DEFAULT_KINDS = tuple(k for k in KIND_CHOICES if k not in OPT_IN_KINDS)
 CHANNEL_GROUPS = ("video", "short", "live", "post")
+# Destination kind -> the kind whose mention it uses when it has none of its own.
+MENTION_FALLBACK = {"member_post": "post", "collab": "live"}
 
 
 def kind_key(kind: str) -> str:
     """Notification kind (render.HEADLINES key) -> destination kind key."""
-    return "member_post" if kind == "member_post" else render.GROUPS[kind]
+    return render.DEST_KINDS.get(kind) or render.GROUPS[kind]
 
 
 @dataclass
@@ -29,7 +36,7 @@ class Destination:
     name: str
     channels: dict[str, str]  # "default" and/or video/short/live/post -> channel id
     mentions: dict[str, str] = field(default_factory=dict)  # kind key -> mention text
-    kinds: set[str] = field(default_factory=lambda: set(KIND_CHOICES))
+    kinds: set[str] = field(default_factory=lambda: set(KIND_CHOICES))  # main: everything
     enabled: bool = True
 
     def wants(self, kind: str) -> bool:
@@ -41,9 +48,7 @@ class Destination:
 
     def mention_for(self, kind: str) -> str | None:
         key = kind_key(kind)
-        if key == "member_post":
-            return self.mentions.get("member_post") or self.mentions.get("post")
-        return self.mentions.get(key)
+        return self.mentions.get(key) or self.mentions.get(MENTION_FALLBACK.get(key, ""))
 
     def all_channels(self) -> list[str]:
         return sorted(set(self.channels.values()))
@@ -63,7 +68,7 @@ class Destination:
             name=name,
             channels={k: str(v) for k, v in (data.get("channels") or {}).items() if v},
             mentions={k: str(v) for k, v in (data.get("mentions") or {}).items() if v},
-            kinds=set(kinds) & set(KIND_CHOICES) if kinds is not None else set(KIND_CHOICES),
+            kinds=set(kinds) & set(KIND_CHOICES) if kinds is not None else set(DEFAULT_KINDS),
             enabled=bool(data.get("enabled", True)),
         )
 

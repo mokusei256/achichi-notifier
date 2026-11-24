@@ -28,6 +28,23 @@ def test_resolve_main_and_stored_destinations(tmp_path):
     assert not resolved["off"].wants("video")
 
 
+def test_collab_notices_go_to_main_and_only_to_stored_destinations_that_list_them(tmp_path):
+    cfg = _cfg(tmp_path, mentions={"live": "<@&1>"})
+    state = State(destinations={
+        "plain": {"channels": {"default": "200"}, "kinds": list(dests.DEFAULT_KINDS), "enabled": True},
+        "older": {"channels": {"default": "300"}, "enabled": True},  # saved before kinds were stored
+        "fans": {"channels": {"default": "400"}, "kinds": ["collab"], "mentions": {"collab": "<@&4>"},
+                 "enabled": True},
+    })
+    resolved = {d.name: d for d in dests.resolve(cfg, state)}
+    assert [n for n, d in resolved.items() if d.wants("collab_live")] == ["main", "fans"]
+    assert not resolved["fans"].wants("live_now")
+    assert resolved["main"].channel_for("collab_live") == "1"  # the live channel
+    assert resolved["main"].mention_for("collab_live") == "<@&1>"  # the live mention
+    assert resolved["fans"].mention_for("collab_live") == "<@&4>"
+    assert all(resolved[n].wants("live_now") for n in ("main", "plain", "older"))
+
+
 def test_destinations_merge_newest_list_wins():
     runner = State(destinations={"old": {"channels": {"default": "1"}}},
                    destinations_updated="2026-11-15T00:00:00+00:00")
@@ -373,6 +390,14 @@ def test_cli_add_list_disable_remove(monkeypatch, tmp_path, capsys):
     stored = json.loads((tmp_path / "state.json").read_text())["destinations"]["big"]
     assert stored["channels"] == {"default": "123456789012345678"}
     assert stored["kinds"] == ["live", "post"] and stored["mentions"] == {"live": "<@&5>"}
+    assert dest_cli.cmd_add(cfg, Args(name="plain", channel="123456789012345679")) == 0
+    stored = json.loads((tmp_path / "state.json").read_text())["destinations"]["plain"]
+    assert stored["kinds"] == sorted(dests.DEFAULT_KINDS) and "collab" not in stored["kinds"]
+    assert dest_cli.cmd_add(cfg, Args(name="plain", channel="123456789012345679",
+                                      kinds="video,collab")) == 0
+    assert json.loads((tmp_path / "state.json").read_text())["destinations"]["plain"]["kinds"] == [
+        "collab", "video"]
+    assert dest_cli.cmd_remove(cfg, "plain") == 0
     assert dest_cli.cmd_list(cfg) == 0 and "big" in capsys.readouterr().out
     assert dest_cli.cmd_enable(cfg, "big", False) == 0
     assert json.loads((tmp_path / "state.json").read_text())["destinations"]["big"]["enabled"] is False

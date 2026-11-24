@@ -119,6 +119,9 @@ class Config:
     firefox_exe: Path | None = None
     refresh_seconds: int = 150
     exclude_live_titles: str | None = DEFAULT_EXCLUDE_LIVE_TITLES  # regex; None = announce all
+    # Where this runner keeps the current thumbnail of each video (the "before" image of a
+    # thumbnail change notice). None: notices show the new thumbnail only.
+    thumb_dir: Path | None = None
 
     @classmethod
     def from_env(cls) -> Config:
@@ -172,6 +175,7 @@ class Config:
             firefox_exe=_env_path("FIREFOX_EXE"),
             refresh_seconds=_env_number("FIREFOX_REFRESH_SECONDS", 150),
             exclude_live_titles=exclude,
+            thumb_dir=_env_path("THUMB_DIR"),
         )
 
     @property

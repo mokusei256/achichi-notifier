@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from achichi_notifier import control, notifier, render
+from achichi_notifier import destinations as dests
 from achichi_notifier.config import DEFAULT_EXCLUDE_LIVE_TITLES
 from achichi_notifier.discord_api import DiscordError
 from achichi_notifier.state import FileStateStore, State
@@ -42,6 +43,8 @@ class Watch(FakeYouTube):
             broadcast["endTimestamp"] = page["ended"].isoformat()
         details = {"title": page.get("title") or ref.title, "isLiveContent": True,
                    "isUpcoming": page["status"] == "upcoming", "isLive": page["status"] == "live"}
+        if page.get("channel_id"):
+            details["channelId"] = page["channel_id"]
         micro = {"publishDate": (_now() - timedelta(days=5)).isoformat(), "liveBroadcastDetails": broadcast}
         return classify_video({"videoDetails": details,
                                "microformat": {"playerMicroformatRenderer": micro}}, ref)
@@ -1163,3 +1166,83 @@ def test_a_listed_watch_without_a_start_time_survives_a_run_whose_listing_misses
     _write_state(tmp_path, state)
     _run(wired)  # listed again, the tab still says "upcoming"
     assert _sent("colisted001") == [START]
+
+
+@pytest.mark.parametrize("host", ["other", "unknown", "here"])
+def test_a_watched_start_goes_only_where_collabs_are_taken_unless_it_is_this_channels(wired, tmp_path, host):
+    store = FileStateStore(tmp_path / "state.json")
+    state = store.load()
+    state.destinations["friend"] = {"channels": {"default": "500"}, "kinds": list(dests.DEFAULT_KINDS),
+                                    "enabled": True}
+    state.destinations["older"] = {"channels": {"default": "600"}, "enabled": True}  # saved without kinds
+    state.destinations["fans"] = {"channels": {"default": "700"}, "kinds": ["collab"], "enabled": True}
+    state.destinations_updated = "2099-01-01T00:00:00+00:00"
+    state.live["collab00002"] = {"scheduled": (_now() + timedelta(minutes=5)).isoformat(), "done": None,
+                                 "at": _now().isoformat(), "external": True, "title": "【コラボ】"}
+    store.save(state)
+    page = {"status": "live", "started": _now()}
+    if host != "unknown":
+        page["channel_id"] = wired.youtube_channel_id if host == "here" else "UCsomeoneelse"
+    Watch.pages = {"collab00002": page}
+    _run(wired)
+    everywhere = host == "here"  # registered with `watch`, but on this channel: like its own streams
+    assert _sent("collab00002") == [START]  # main (.env) takes collabs
+    assert _sent("collab00002", "500") == ([START] if everywhere else [])
+    assert _sent("collab00002", "600") == ([START] if everywhere else [])
+    assert _sent("collab00002", "700") == ([] if everywhere else [START])
+    assert _state(tmp_path)["live"]["collab00002"]["done"] == "started"
+    _run(wired)
+    assert len([c for c, _ in Discord.posted]) == (3 if everywhere else 2)
+
+
+def test_a_collab_start_missed_by_a_destination_taking_collabs_is_resent_only_there(wired, tmp_path):
+    store = FileStateStore(tmp_path / "state.json")
+    state = store.load()
+    state.destinations["fans"] = {"channels": {"default": "700"}, "kinds": ["live", "collab"],
+                                  "mentions": {"live": "<@&7>"}, "enabled": True}
+    state.destinations["friend"] = {"channels": {"default": "500"}, "kinds": list(dests.DEFAULT_KINDS),
+                                    "enabled": True}
+    state.destinations_updated = "2099-01-01T00:00:00+00:00"
+    state.live["collab00003"] = {"scheduled": (_now() + timedelta(minutes=5)).isoformat(), "done": None,
+                                 "at": _now().isoformat(), "external": True}
+    store.save(state)
+    Watch.pages = {"collab00003": {"status": "live", "started": _now(), "channel_id": "UCsomeoneelse"}}
+    Discord.fail = {"700": 503}
+    _run(wired)
+    assert _sent("collab00003") == [START] and _sent("collab00003", "700") == []
+    assert list(_state(tmp_path)["undelivered"]) == ["fans|live_start|collab00003"]
+    Discord.fail = {}
+    _run(wired)
+    assert _sent("collab00003", "700") == [f"<@&7> {START}"]  # the live mention, as collabs have none
+    assert _sent("collab00003") == [START] and _sent("collab00003", "500") == []
+
+
+def test_a_watched_stream_also_listed_here_gets_its_start_where_its_slot_went(wired, tmp_path, monkeypatch):
+    store = FileStateStore(tmp_path / "state.json")
+    state = store.load()
+    state.destinations["friend"] = {"channels": {"default": "500"}, "kinds": list(dests.DEFAULT_KINDS),
+                                    "enabled": True}
+    state.destinations_updated = "2099-01-01T00:00:00+00:00"
+    state.live["colisted002"] = {"scheduled": (_now() + timedelta(hours=1)).isoformat(), "done": None,
+                                 "at": _now().isoformat(), "external": True}
+    store.save(state)
+    _set_listing(_stream("colisted002", "upcoming"))  # the host's stream, shown in this channel's tabs
+    Watch.pages = {"colisted002": {"status": "upcoming", "scheduled": _now() + timedelta(hours=1),
+                                   "channel_id": "UCsomeoneelse"}}
+    _run(wired)
+    assert _sent("colisted002", "500") == [SLOT]
+    _set_listing(_stream("colisted002", "live"))
+    Watch.pages["colisted002"] = {"status": "live", "started": _now(), "channel_id": "UCsomeoneelse"}
+    _run(wired)
+    assert _sent("colisted002", "500") == [SLOT, START] and _sent("colisted002") == [SLOT, START]
+
+
+@pytest.mark.parametrize("host", ["UC", "UCsomeoneelse"])
+def test_the_watch_command_says_where_the_start_notice_goes(wired, tmp_path, monkeypatch, capsys, host):
+    from achichi_notifier import watch_cli
+    _watch_cli(monkeypatch, tmp_path)
+    Watch.pages = {"saywhere001": {"status": "upcoming", "scheduled": _now() + timedelta(hours=2),
+                                   "title": "【コラボ】", "channel_id": host}}
+    assert watch_cli.cmd_add(wired, "saywhere001") == 0
+    out = capsys.readouterr().out
+    assert ("すべての送り先" in out) and (("collab を入れた送り先だけ" in out) == (host != "UC"))
